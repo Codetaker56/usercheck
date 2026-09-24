@@ -6,9 +6,15 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a release with this tag, e.g. v1.0.0 (leave empty to just build)"
+        required: false
+        default: ""
 
 jobs:
-  # Ready-to-run Windows .exe, no DLLs needed. Pushing a v* tag attaches it to a release.
+  # Ready-to-run Windows .exe, no DLLs needed. Pushing a v* tag, or running this
+  # workflow by hand with a release tag, publishes it as a GitHub release.
   windows-exe:
     runs-on: ubuntu-latest
     permissions:
@@ -21,9 +27,11 @@ jobs:
         with:
           name: usercheck-windows
           path: usercheck.exe
-      - if: startsWith(github.ref, 'refs/tags/v')
+      - if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: usercheck.exe
 
   # Makes sure the CMake build works everywhere (MSVC on Windows).
