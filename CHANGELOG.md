@@ -2,6 +2,19 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.2.0
+
+Much faster Roblox and Minecraft, a GitHub token option, and three new apps.
+
+- **Roblox** looks names up 100 at a time. Anything that isn't an existing account still goes through sign-up validation, so hits are exactly as reliable as before. In testing, 300 random 4-character names took 2 seconds instead of about 3 minutes.
+- **Minecraft** looks names up 10 at a time with Mojang's bulk lookup. 100 names took 11 seconds instead of well over a minute and a half.
+- **GitHub** can use GitHub's API with a token (Other apps > GitHub token), which allows 5,000 checks an hour. Without a token it keeps loading profile pages, because the API only allows 60 checks an hour without one.
+- **New: Lichess.** Looks names up 300 at a time. Closed accounts count as taken, since Lichess never frees a name.
+- **New: Chess.com.** Checks with the public API, then double-checks hits with the sign-up form's check, which also catches banned words. That one only allows about 4 checks a minute, so hits past that are marked "not double-checked".
+- **New: GitLab.** Uses the check GitLab's sign-up form does, so group names and names GitLab reserves are caught too. GitLab allows about 20 of these a minute, so it waits 3 seconds between checks by default.
+- "Seconds between checks" is now "seconds between requests". Names a batch lookup already answered don't wait.
+- Turning off webhook pings no longer wipes the rest of `ringer.cfg` (like remembered rate limits or the GitHub token).
+
 ## v2.1.0
 
 More Discord checks per half hour.

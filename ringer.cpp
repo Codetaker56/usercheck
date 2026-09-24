@@ -48,10 +48,7 @@ namespace {
 const char* USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36";
-// Tests build with -DDISCORD_API=... to point this at a fake server.
-#ifndef DISCORD_API
-#  define DISCORD_API "https://discord.com/api/v9"
-#endif
+const std::string DISCORD_API = "https://discord.com/api/v9";
 
 const char* RESULTS_FILE = "available.txt";
 const char* UNCHECKED_FILE = "unchecked.txt";  // what a stopped .txt file run didn't get to
@@ -256,28 +253,10 @@ bool parse_hex4(const std::string& s, size_t pos, unsigned& out) {
     return true;
 }
 
-// Finds the first "key": at or after `from` and puts its value in `out`.
-// Strings come back unescaped, numbers/bools/null as their raw text.
-bool json_get(const std::string& doc, const std::string& key, std::string& out, size_t from = 0) {
-    const std::string needle = "\"" + key + "\"";
-    size_t i = doc.find(needle, from);
-    if (i == std::string::npos) return false;
-    i += needle.size();
-    auto skip_ws = [&] {
-        while (i < doc.size() && (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\r' || doc[i] == '\n')) ++i;
-    };
-    skip_ws();
-    if (i >= doc.size() || doc[i] != ':') return false;
-    ++i;
-    skip_ws();
-    if (i >= doc.size()) return false;
-
+// Reads the string that starts with the quote at doc[i] into `out`, unescaped.
+bool json_string(const std::string& doc, size_t i, std::string& out) {
     out.clear();
-    if (doc[i] != '"') {
-        size_t end = doc.find_first_of(",}] \t\r\n", i);
-        out = doc.substr(i, end == std::string::npos ? std::string::npos : end - i);
-        return true;
-    }
+    if (i >= doc.size() || doc[i] != '"') return false;
     for (++i; i < doc.size(); ++i) {
         char c = doc[i];
         if (c == '"') return true;
@@ -311,16 +290,83 @@ bool json_get(const std::string& doc, const std::string& key, std::string& out, 
     return false;
 }
 
+// Finds the first "key": at or after `from` and puts its value in `out`.
+// Strings come back unescaped, numbers/bools/null as their raw text.
+bool json_get(const std::string& doc, const std::string& key, std::string& out, size_t from = 0) {
+    const std::string needle = "\"" + key + "\"";
+    size_t i = doc.find(needle, from);
+    if (i == std::string::npos) return false;
+    i += needle.size();
+    auto skip_ws = [&] {
+        while (i < doc.size() && (doc[i] == ' ' || doc[i] == '\t' || doc[i] == '\r' || doc[i] == '\n')) ++i;
+    };
+    skip_ws();
+    if (i >= doc.size() || doc[i] != ':') return false;
+    ++i;
+    skip_ws();
+    if (i >= doc.size()) return false;
+    if (doc[i] == '"') return json_string(doc, i, out);
+    size_t end = doc.find_first_of(",}] \t\r\n", i);
+    out = doc.substr(i, end == std::string::npos ? std::string::npos : end - i);
+    return true;
+}
+
+// Adds every string value of "key" in `doc` to `into`, lowercased. That's how the names get
+// pulled out of a batch lookup's answer.
+void json_names(const std::string& doc, const std::string& key, std::set<std::string>& into) {
+    const std::string needle = "\"" + key + "\"";
+    std::string value;
+    for (size_t i = doc.find(needle); i != std::string::npos; i = doc.find(needle, i + 1)) {
+        if (json_get(doc, key, value, i) && value != "null") into.insert(to_lower(value));
+    }
+}
+
+// ["a","b"]
+std::string json_list(const std::vector<std::string>& items) {
+    std::string out;
+    for (const std::string& item : items) out += (out.empty() ? "" : ",") + json_quote(item);
+    return "[" + out + "]";
+}
+
 // ---------------------------------------------------------------------------
 // HTTP
 // ---------------------------------------------------------------------------
 
 struct Response {
-    long status = 0;          // 0 means no answer at all, see `error`
+    long status = 0;                             // 0 means no answer at all, see `error`
     std::string body;
-    std::string retry_after;  // Retry-After header, if the server sent one
+    std::map<std::string, std::string> headers;  // names lowercased
     std::string error;
+
+    std::string header(const std::string& name) const {
+        auto it = headers.find(name);
+        return it == headers.end() ? "" : it->second;
+    }
 };
+
+// Extras for the requests that need them.
+struct Options {
+    std::vector<std::string> headers;               // extra "Name: value" lines
+    std::string content_type = "application/json";  // of the body, if there is one
+    bool follow_redirects = true;
+};
+
+// Adds a "Name: value" header line to `headers`. Anything else, like the status line, is ignored.
+void add_header(std::map<std::string, std::string>& headers, const std::string& line) {
+    size_t colon = line.find(':');
+    if (colon != std::string::npos) headers[to_lower(trim(line.substr(0, colon)))] = trim(line.substr(colon + 1));
+}
+
+// Tests build with -DTEST_SERVER='"http://127.0.0.1:8000"' to send every request to a fake server
+// instead, with the real host moved into the path: https://discord.com/api/v9/... becomes
+// http://127.0.0.1:8000/discord.com/api/v9/...
+std::string route(const std::string& url) {
+#ifdef TEST_SERVER
+    return TEST_SERVER "/" + url.substr(url.find("://") + 3);
+#else
+    return url;
+#endif
+}
 
 #ifdef _WIN32
 
@@ -340,7 +386,8 @@ struct WinHttpHandle {
     WinHttpHandle& operator=(const WinHttpHandle&) = delete;
 };
 
-Response http(const std::string& method, const std::string& url, const std::string& body = "") {
+Response http(const std::string& method, const std::string& url, const std::string& body = "",
+              const Options& opt = {}) {
     Response r;
     static HINTERNET session = [] {
         HINTERNET s = WinHttpOpen(widen(USER_AGENT).c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -353,7 +400,7 @@ Response http(const std::string& method, const std::string& url, const std::stri
         return r;
     }
 
-    std::wstring wurl = widen(url);
+    std::wstring wurl = widen(route(url));
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
     uc.dwHostNameLength = static_cast<DWORD>(-1);
@@ -381,8 +428,15 @@ Response http(const std::string& method, const std::string& url, const std::stri
         return r;
     }
 
-    std::wstring headers = L"Accept: application/json, text/html\r\n";
-    if (!body.empty()) headers += L"Content-Type: application/json\r\n";
+    if (!opt.follow_redirects) {
+        DWORD off = WINHTTP_DISABLE_REDIRECTS;
+        WinHttpSetOption(req.h, WINHTTP_OPTION_DISABLE_FEATURE, &off, sizeof(off));
+    }
+
+    std::string head = "Accept: application/json, text/html\r\n";
+    if (!body.empty()) head += "Content-Type: " + opt.content_type + "\r\n";
+    for (const std::string& h : opt.headers) head += h + "\r\n";
+    const std::wstring headers = widen(head);
     DWORD len = static_cast<DWORD>(body.size());
     LPVOID data = body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data());
     if (!WinHttpSendRequest(req.h, headers.c_str(), static_cast<DWORD>(-1), data, len, len, 0) ||
@@ -397,10 +451,23 @@ Response http(const std::string& method, const std::string& url, const std::stri
                         WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
     r.status = static_cast<long>(status);
 
-    wchar_t retry[64];
-    size = sizeof(retry);
-    if (WinHttpQueryHeaders(req.h, WINHTTP_QUERY_CUSTOM, L"Retry-After", retry, &size, WINHTTP_NO_HEADER_INDEX)) {
-        for (DWORD i = 0; i < size / sizeof(wchar_t); ++i) r.retry_after += static_cast<char>(retry[i]);
+    // All the headers at once, one per line. The first call just says how much room they need.
+    size = 0;
+    WinHttpQueryHeaders(req.h, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX,
+                        WINHTTP_NO_OUTPUT_BUFFER, &size, WINHTTP_NO_HEADER_INDEX);
+    std::wstring raw(size / sizeof(wchar_t) + 1, L'\0');
+    if (size && WinHttpQueryHeaders(req.h, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, &raw[0],
+                                    &size, WINHTTP_NO_HEADER_INDEX)) {
+        std::string line;
+        for (DWORD i = 0; i < size / sizeof(wchar_t); ++i) {
+            if (raw[i] == L'\n') {
+                add_header(r.headers, line);
+                line.clear();
+            } else if (raw[i] != L'\r') {
+                line += raw[i] < 0x80 ? static_cast<char>(raw[i]) : '?';
+            }
+        }
+        add_header(r.headers, line);
     }
 
     for (;;) {
@@ -421,15 +488,15 @@ size_t on_body(char* p, size_t size, size_t n, void* userdata) {
 }
 
 size_t on_header(char* p, size_t size, size_t n, void* userdata) {
-    auto* retry_after = static_cast<std::string*>(userdata);
+    auto* headers = static_cast<std::map<std::string, std::string>*>(userdata);
     std::string line(p, size * n);
-    std::string lower = to_lower(line);
-    if (starts_with(lower, "http/")) retry_after->clear();  // new response after a redirect
-    else if (starts_with(lower, "retry-after:")) *retry_after = trim(line.substr(12));
+    if (starts_with(to_lower(line), "http/")) headers->clear();  // new response after a redirect
+    else add_header(*headers, line);
     return size * n;
 }
 
-Response http(const std::string& method, const std::string& url, const std::string& body = "") {
+Response http(const std::string& method, const std::string& url, const std::string& body = "",
+              const Options& opt = {}) {
     Response r;
     static CURL* curl = [] {
         curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -440,19 +507,21 @@ Response http(const std::string& method, const std::string& url, const std::stri
         return r;
     }
 
+    const std::string where = route(url);
     curl_easy_reset(curl);
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_URL, where.c_str());
     curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, opt.follow_redirects ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_body);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r.body);
     curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, on_header);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r.retry_after);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &r.headers);
 
     curl_slist* headers = curl_slist_append(nullptr, "Accept: application/json, text/html");
+    for (const std::string& h : opt.headers) headers = curl_slist_append(headers, h.c_str());
     if (method == "POST") {
-        headers = curl_slist_append(headers, "Content-Type: application/json");
+        headers = curl_slist_append(headers, ("Content-Type: " + opt.content_type).c_str());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
     }
@@ -477,7 +546,7 @@ double retry_after_seconds(const Response& r) {
     double seconds = 0;
     try {
         if (json_get(r.body, "retry_after", value)) seconds = std::stod(value);
-        else if (!r.retry_after.empty()) seconds = std::stod(r.retry_after);
+        else if (!r.header("retry-after").empty()) seconds = std::stod(r.header("retry-after"));
     } catch (const std::exception&) {
     }
     return seconds > 0 ? std::max(seconds, 1.0) : 0;
@@ -496,13 +565,23 @@ struct Result {
     bool unconfirmed = false;  // for Available: only the looser check saw it (see check_discord)
 };
 
+// Looks up a batch of names in one request. Returns false with `why` set (an Error or RateLimited
+// result) if it couldn't, otherwise adds the names that belong to an account to `found`, lowercased.
+using Lookup = std::function<bool(const std::vector<std::string>& names, std::set<std::string>& found, Result& why)>;
+
 struct Platform {
     std::string name;
     std::string charset;                              // used for random "characters" names
     std::function<bool(const std::string&)> valid;    // local rule check, saves wasted requests
-    std::function<Result(const std::string&)> check;
+    std::function<Result(const std::string&)> check;  // checks one name
     double delay = 1.0;                               // default seconds between requests
     std::string note;                                 // caveat shown before checking
+    // Optional, for sites that can look up lots of names at once. Names `lookup` finds are taken.
+    // The rest count as available, or go through `check` first if `confirm` is set. If a lookup
+    // fails for any reason other than a rate limit, its names go through `check` one at a time.
+    Lookup lookup = nullptr;
+    size_t batch = 0;  // most names per lookup
+    bool confirm = false;
 };
 
 // Handles the answers every check treats the same: no response, and rate limits.
@@ -534,7 +613,7 @@ Result check_profile_url(const std::string& url) {
 
 // Discord's sign-up check, the one that decides whether you can register a name.
 Result discord_attempt(const std::string& u) {
-    Response r = http("POST", DISCORD_API "/unique-username/username-attempt-unauthed",
+    Response r = http("POST", DISCORD_API + "/unique-username/username-attempt-unauthed",
                       "{\"username\":" + json_quote(u) + "}");
     Result out;
     if (common_result(r, out)) return out;
@@ -580,7 +659,7 @@ Lane g_discord_suggest, g_discord_attempt;
 Result check_discord(const std::string& u) {
     bool looks_free = false;
     if (g_discord_suggest.open()) {
-        Response r = http("GET", DISCORD_API "/unique-username/username-suggestions-unauthed?global_name=" +
+        Response r = http("GET", DISCORD_API + "/unique-username/username-suggestions-unauthed?global_name=" +
                                      url_encode(u));
         std::string suggestion;
         if (r.status == 429) {
@@ -612,6 +691,7 @@ bool valid_discord(const std::string& u) {
            u.find("..") == std::string::npos;
 }
 
+// Roblox's sign-up validation, so "available" means Roblox would let you register it.
 Result check_roblox(const std::string& u) {
     Response r = http("GET", "https://auth.roblox.com/v1/usernames/validate?Username=" + url_encode(u) +
                                  "&Birthday=" + url_encode("2000-01-01T00:00:00.000Z"));
@@ -625,6 +705,21 @@ Result check_roblox(const std::string& u) {
     return {State::Invalid, msg};
 }
 
+// Roblox's user lookup takes 100 names per request and knows every account, banned ones included.
+// It answers with the ones it found, as the name asked for and the account's current name.
+bool lookup_roblox(const std::vector<std::string>& names, std::set<std::string>& found, Result& why) {
+    Response r = http("POST", "https://users.roblox.com/v1/usernames/users",
+                      "{\"usernames\":" + json_list(names) + ",\"excludeBannedUsers\":false}");
+    if (common_result(r, why)) return false;
+    if (r.status != 200 || r.body.find("\"data\"") == std::string::npos) {
+        why = {State::Error, http_error(r)};
+        return false;
+    }
+    json_names(r.body, "requestedUsername", found);
+    json_names(r.body, "name", found);
+    return true;
+}
+
 bool valid_roblox(const std::string& u) {
     return u.size() >= 3 && u.size() <= 20 && only_chars(u, LOWER + UPPER + DIGITS + "_") &&
            std::count(u.begin(), u.end(), '_') <= 1 && u.front() != '_' && u.back() != '_';
@@ -632,6 +727,19 @@ bool valid_roblox(const std::string& u) {
 
 Result check_minecraft(const std::string& u) {
     return check_profile_url("https://api.mojang.com/users/profiles/minecraft/" + url_encode(u));
+}
+
+// Mojang's bulk profile lookup takes 10 names per request and answers with the ones that exist.
+bool lookup_minecraft(const std::vector<std::string>& names, std::set<std::string>& found, Result& why) {
+    Response r = http("POST", "https://api.minecraftservices.com/minecraft/profile/lookup/bulk/byname",
+                      json_list(names));
+    if (common_result(r, why)) return false;
+    if (r.status != 200 || r.body.find('[') == std::string::npos) {
+        why = {State::Error, http_error(r)};
+        return false;
+    }
+    json_names(r.body, "name", found);
+    return true;
 }
 
 bool valid_minecraft(const std::string& u) {
@@ -642,9 +750,161 @@ Result check_github(const std::string& u) {
     return check_profile_url("https://github.com/" + url_encode(u));
 }
 
+// GitHub's API. With a token it allows 5,000 checks an hour (60 without one, which is why ringer
+// only uses it when there's a token). Running out gets a 403 or 429 that says when checks come back.
+Result check_github_api(const std::string& u, const std::string& token) {
+    Options opt;
+    opt.headers = {"Authorization: Bearer " + token};
+    Response r = http("GET", "https://api.github.com/users/" + url_encode(u), "", opt);
+    if (r.status == 403 || r.status == 429) {
+        double wait = retry_after_seconds(r);
+        if (wait <= 0 && r.header("x-ratelimit-remaining") == "0") {
+            try {
+                // A reset time, so a wrong PC clock skews it. Checks come back within the hour regardless.
+                wait = std::min(std::stod(r.header("x-ratelimit-reset")) - static_cast<double>(std::time(nullptr)) + 1,
+                                3600.0);
+            } catch (const std::exception&) {
+            }
+        }
+        // GitHub's advice when it doesn't say how long: wait at least a minute.
+        if (wait <= 0 && (r.status == 429 || to_lower(r.body).find("rate limit") != std::string::npos)) wait = 60;
+        if (wait > 0) return {State::RateLimited, "", std::max(wait, 1.0)};
+    }
+    Result out;
+    if (common_result(r, out)) return out;
+    if (r.status == 404) return {State::Available, "no account found"};
+    if (r.status == 200) return {State::Taken, ""};
+    if (r.status == 401) return {State::Error, "GitHub rejected the token, set a new one in Other apps"};
+    return {State::Error, http_error(r)};
+}
+
+// Asks GitHub whether `token` works, without using up a check. Returns "" if it does.
+std::string github_token_problem(const std::string& token) {
+    Options opt;
+    opt.headers = {"Authorization: Bearer " + token};
+    Response r = http("GET", "https://api.github.com/rate_limit", "", opt);
+    if (r.status == 200) return "";
+    if (r.status == 0) return r.error;
+    if (r.status == 401) return "GitHub says that token isn't valid";
+    return http_error(r);
+}
+
 bool valid_github(const std::string& u) {
     return u.size() >= 1 && u.size() <= 39 && only_chars(u, LOWER + UPPER + DIGITS + "-") &&
            u.front() != '-' && u.back() != '-' && u.find("--") == std::string::npos;
+}
+
+bool is_alnum(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+// Every one of `symbols` in `u` has a letter or number right after it, so no symbol at the end
+// and no two in a row.
+bool symbols_between(const std::string& u, const std::string& symbols) {
+    for (size_t i = 0; i < u.size(); ++i) {
+        if (symbols.find(u[i]) != std::string::npos && (i + 1 == u.size() || !is_alnum(u[i + 1]))) return false;
+    }
+    return true;
+}
+
+// Lichess asks for a full minute's wait after a 429.
+Result lichess_patience(Result r) {
+    if (r.state == State::RateLimited && r.retry_after <= 0) r.retry_after = 60;
+    return r;
+}
+
+Result check_lichess(const std::string& u) {
+    return lichess_patience(check_profile_url("https://lichess.org/api/user/" + url_encode(u)));
+}
+
+// Lichess takes 300 names per request and answers with the accounts it found. Closed accounts are
+// in there too, since Lichess never gives a name out again.
+bool lookup_lichess(const std::vector<std::string>& names, std::set<std::string>& found, Result& why) {
+    std::string list;
+    for (const std::string& n : names) list += (list.empty() ? "" : ",") + n;
+    Options opt;
+    opt.content_type = "text/plain";
+    Response r = http("POST", "https://lichess.org/api/users", list, opt);
+    if (common_result(r, why)) {
+        why = lichess_patience(why);
+        return false;
+    }
+    if (r.status != 200 || r.body.find('[') == std::string::npos) {
+        why = {State::Error, http_error(r)};
+        return false;
+    }
+    json_names(r.body, "id", found);
+    return true;
+}
+
+// Lichess' sign-up rules: 2-20 characters, starting with a letter.
+bool valid_lichess(const std::string& u) {
+    return u.size() >= 2 && u.size() <= 20 && only_chars(u, LOWER + UPPER + DIGITS + "_-") &&
+           (LOWER + UPPER).find(u.front()) != std::string::npos && symbols_between(u, "_-");
+}
+
+Lane g_chesscom_signup;
+const double CHESSCOM_REST = 60;  // how long to rest the sign-up check when it doesn't say
+
+// Chess.com's public API says whether an account exists, closed ones included, and it doesn't mind
+// a steady stream of requests, so every name goes through it. Names with no account get
+// double-checked with the sign-up form's check, which also knows about banned words. That one sits
+// behind Cloudflare, though, and only takes a handful of checks before asking for a break
+// (measured Sept 2026: 4 checks, then about a minute). While it's resting, hits are marked not
+// double-checked.
+Result check_chesscom(const std::string& u) {
+    Result res = check_profile_url("https://api.chess.com/pub/player/" + url_encode(to_lower(u)));
+    if (res.state != State::Available) return res;
+    if (g_chesscom_signup.open()) {
+        Response r = http("GET", "https://www.chess.com/callback/user/valid?username=" + url_encode(u));
+        std::string valid, msg;
+        if (r.status == 200 && json_get(r.body, "valid", valid)) {
+            if (valid == "true") return {State::Available, ""};
+            // "messages":["That username is taken. ..."]
+            size_t list = r.body.find('[', r.body.find("\"messages\""));
+            if (list != std::string::npos) json_string(r.body, r.body.find('"', list), msg);
+            if (to_lower(msg).find("taken") != std::string::npos) return {State::Taken, ""};
+            return {State::Invalid, msg.empty() ? "not allowed" : msg};
+        }
+        // Rate limited, a Cloudflare challenge, or something unexpected: give it a rest.
+        const double asked = r.status == 429 ? retry_after_seconds(r) : 0;
+        g_chesscom_signup.rest(asked > 0 ? asked : CHESSCOM_REST);
+    }
+    res.detail = "not double-checked, the sign-up check is resting";
+    res.unconfirmed = true;
+    return res;
+}
+
+// Chess.com's sign-up rules: 3-25 characters, starting with a letter or number.
+bool valid_chesscom(const std::string& u) {
+    return u.size() >= 3 && u.size() <= 25 && only_chars(u, LOWER + UPPER + DIGITS + "_-") && is_alnum(u.front()) &&
+           symbols_between(u, "_-");
+}
+
+// The check GitLab's sign-up form uses. Users and groups share names on GitLab, so it covers
+// both. Names GitLab keeps for itself (like "api" or "explore") redirect to the sign-in page.
+// It allows about 20 checks a minute and its 429s don't say how long to wait.
+Result check_gitlab(const std::string& u) {
+    Options opt;
+    opt.follow_redirects = false;
+    Response r = http("GET", "https://gitlab.com/users/" + url_encode(u) + "/exists", "", opt);
+    Result out;
+    if (common_result(r, out)) return out;
+    if (r.status >= 300 && r.status < 400) return {State::Invalid, "reserved by GitLab"};
+    std::string exists;
+    if (r.status == 200 && json_get(r.body, "exists", exists)) {
+        return {exists == "true" ? State::Taken : State::Available, ""};
+    }
+    return {State::Error, http_error(r)};
+}
+
+bool valid_gitlab(const std::string& u) {
+    const std::string lower = to_lower(u);
+    auto ends_with = [&](const std::string& end) {
+        return lower.size() >= end.size() && lower.compare(lower.size() - end.size(), end.size(), end) == 0;
+    };
+    return u.size() >= 2 && u.size() <= 255 && only_chars(u, LOWER + UPPER + DIGITS + "_.-") && is_alnum(u.front()) &&
+           symbols_between(u, "_.-") && !ends_with(".git") && !ends_with(".atom");
 }
 
 Platform discord_platform() {
@@ -657,21 +917,61 @@ Platform discord_platform() {
 }
 
 Platform roblox_platform() {
-    return {"Roblox", LOWER + DIGITS + "_", valid_roblox, check_roblox, 0.5,
-            "Uses Roblox's sign-up validation, so 'available' means Roblox "
-            "would actually let you register it."};
+    Platform p{"Roblox", LOWER + DIGITS + "_", valid_roblox, check_roblox, 0.5,
+               "Looks names up 100 at a time, then runs anything that isn't an existing account "
+               "through Roblox's sign-up validation, so 'available' means Roblox would actually "
+               "let you register it."};
+    p.lookup = lookup_roblox;
+    p.batch = 100;
+    p.confirm = true;
+    return p;
 }
 
 Platform minecraft_platform() {
-    return {"Minecraft (Java)", LOWER + DIGITS + "_", valid_minecraft, check_minecraft, 1.0,
-            "Checks for an existing profile. Names that were just changed are "
-            "locked for a while and banned names also show as free."};
+    Platform p{"Minecraft (Java)", LOWER + DIGITS + "_", valid_minecraft, check_minecraft, 1.0,
+               "Looks names up 10 at a time with Mojang's profile lookup. Names that were just "
+               "changed are locked for a while and banned names also show as free."};
+    p.lookup = lookup_minecraft;
+    p.batch = 10;
+    return p;
 }
 
-Platform github_platform() {
-    return {"GitHub", LOWER + DIGITS + "-", valid_github, check_github, 1.5,
-            "Checks whether the profile page exists. Reserved and deleted "
-            "names can 404 but still can't be registered."};
+Platform github_platform(const std::string& token) {
+    if (token.empty()) {
+        return {"GitHub", LOWER + DIGITS + "-", valid_github, check_github, 1.5,
+                "Checks whether the profile page exists. Reserved and deleted names can 404 but "
+                "still can't be registered. Add a GitHub token (Other apps > GitHub token) to use "
+                "GitHub's API instead, which allows 5,000 checks an hour."};
+    }
+    return {"GitHub", LOWER + DIGITS + "-", valid_github,
+            [token](const std::string& u) { return check_github_api(u, token); }, 0.75,
+            "Uses GitHub's API with your token, which allows 5,000 checks an hour. Reserved and "
+            "deleted names come back as not found but still can't be registered."};
+}
+
+Platform lichess_platform() {
+    Platform p{"Lichess", LOWER + DIGITS + "_-", valid_lichess, check_lichess, 1.0,
+               "Looks names up 300 at a time. Closed accounts count as taken, because Lichess "
+               "never frees a name. Lichess also turns down some offensive names at sign-up, "
+               "which ringer can't see."};
+    p.lookup = lookup_lichess;
+    p.batch = 300;
+    return p;
+}
+
+Platform chesscom_platform() {
+    return {"Chess.com", LOWER + DIGITS + "_-", valid_chesscom, check_chesscom, 0.5,
+            "Checks each name with Chess.com's public API, then double-checks names with no account "
+            "using the sign-up form's check, which also catches banned words. Chess.com only allows "
+            "a handful of those before it wants a break, so while it rests, hits are marked "
+            "\"not double-checked\" and the run keeps going."};
+}
+
+Platform gitlab_platform() {
+    return {"GitLab", LOWER + DIGITS + "_.-", valid_gitlab, check_gitlab, 3.0,
+            "Uses the check GitLab's sign-up form does. Users and groups share names on GitLab, so "
+            "a group's name counts as taken, and names GitLab keeps for its own pages show as not "
+            "allowed. GitLab only allows about 20 of these checks a minute, hence the 3 seconds."};
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +1225,8 @@ std::string clock_in(double seconds) {
 
 struct Config {
     std::string webhook;
-    std::string mention;  // "", "@everyone", or a Discord user ID
+    std::string mention;       // "", "@everyone", or a Discord user ID
+    std::string github_token;  // makes GitHub checks use the API, see check_github_api
     // App name -> when its last long rate limit ends (unix time), so a restart knows about it.
     std::map<std::string, long long> limited_until;
 };
@@ -943,6 +1244,8 @@ Config load_config() {
             cfg.webhook = value;
         } else if (key == "mention") {
             cfg.mention = value;
+        } else if (key == "github_token") {
+            cfg.github_token = value;
         } else if (starts_with(key, "limited_until.")) {
             try {
                 cfg.limited_until[key.substr(14)] = std::stoll(value);
@@ -956,6 +1259,7 @@ Config load_config() {
 bool save_config(const Config& cfg) {
     std::ofstream f(CONFIG_FILE);
     f << "webhook=" << cfg.webhook << "\n" << "mention=" << cfg.mention << "\n";
+    if (!cfg.github_token.empty()) f << "github_token=" << cfg.github_token << "\n";
     const long long now = std::time(nullptr);
     for (const auto& app : cfg.limited_until) {
         if (app.second > now) f << "limited_until." << app.first << "=" << app.second << "\n";
@@ -1102,7 +1406,8 @@ void webhook_settings(Config& cfg) {
             if (err.empty()) flash(GREEN, "Sent. Check your channel.");
             else flash(RED, "Didn't work: " + err);
         } else {
-            cfg = Config{};
+            cfg.webhook.clear();
+            cfg.mention.clear();
             if (save_config(cfg)) flash(GREEN, "Webhook turned off.");
             else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
         }
@@ -1151,20 +1456,79 @@ bool custom_platform(Platform& out) {
     return true;
 }
 
+void github_token_settings(Config& cfg) {
+    for (;;) {
+        screen({"ringer", "Other apps", "GitHub token"});
+        const bool on = !cfg.github_token.empty();
+        print_lines(box("GitHub token", {
+            paint(DIM, "Status   ") + (on ? paint(GREEN, "on") : "off"),
+            paint(DIM, "Checks   ") + (on ? "GitHub's API, 5,000 an hour" : "profile pages"),
+        }, ui_width()));
+        std::cout << "\n";
+
+        int pick = menu("What do you want to do?", {{"Set token", ""}, {"Remove token", ""}}, "Back");
+        if (pick == 0) return;
+        if (pick == 2) {
+            if (!on) {
+                flash(YELLOW, "There's no token to remove.");
+                continue;
+            }
+            cfg.github_token.clear();
+            if (save_config(cfg)) flash(GREEN, "Token removed. GitHub checks use profile pages again.");
+            else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
+            continue;
+        }
+
+        screen({"ringer", "Other apps", "GitHub token", "Set token"});
+        text_box("Where to get one",
+                 "On github.com: Settings > Developer settings > Personal access tokens > Fine-grained "
+                 "tokens > Generate new token. It doesn't need any permissions, the defaults are fine. "
+                 "Treat it like a password, ringer saves it in " + std::string(CONFIG_FILE) + ".");
+        std::string token;
+        for (;;) {
+            token = read_line("Token (blank to go back): ");
+            if (token.empty() || only_chars(token, LOWER + UPPER + DIGITS + "_")) break;
+            say_error("That doesn't look like a GitHub token.");
+        }
+        if (token.empty()) continue;
+        std::cout << "\n " << paint(DIM, "Checking it with GitHub...") << std::flush;
+        std::string problem = github_token_problem(token);
+        if (!problem.empty()) {
+            flash(RED, "Didn't work: " + problem);
+            continue;
+        }
+        cfg.github_token = token;
+        if (save_config(cfg)) flash(GREEN, "Token saved. GitHub checks use the API now.");
+        else flash(YELLOW, "The token works, but ringer couldn't save it to " + std::string(CONFIG_FILE) + ".");
+    }
+}
+
 // Returns false if they backed out to the main menu.
-bool pick_other_app(const Config& cfg, Platform& out) {
+bool pick_other_app(Config& cfg, Platform& out) {
     for (;;) {
         screen({"ringer", "Other apps"});
+        const bool token = !cfg.github_token.empty();
         int pick = menu("Which app?",
-                        {{"Minecraft (Java)", limit_hint(cfg, "Minecraft (Java)", "Mojang lookup")},
-                         {"GitHub", limit_hint(cfg, "GitHub", "profile page")},
-                         {"Custom site", "any profile URL"}},
+                        {{"Minecraft (Java)", limit_hint(cfg, "Minecraft (Java)", "10 per request")},
+                         {"GitHub", limit_hint(cfg, "GitHub", token ? "API, with token" : "profile page")},
+                         {"Lichess", limit_hint(cfg, "Lichess", "300 per request")},
+                         {"Chess.com", limit_hint(cfg, "Chess.com", "sign-up check")},
+                         {"GitLab", limit_hint(cfg, "GitLab", "sign-up check")},
+                         {"Custom site", "any profile URL"},
+                         {"GitHub token", token ? paint(GREEN, "on") : "off"}},
                         "Back");
-        if (pick == 0) return false;
-        if (pick == 1) out = minecraft_platform();
-        else if (pick == 2) out = github_platform();
-        else if (!custom_platform(out)) continue;
-        return true;
+        switch (pick) {
+            case 0: return false;
+            case 1: out = minecraft_platform(); return true;
+            case 2: out = github_platform(cfg.github_token); return true;
+            case 3: out = lichess_platform(); return true;
+            case 4: out = chesscom_platform(); return true;
+            case 5: out = gitlab_platform(); return true;
+            case 6:
+                if (custom_platform(out)) return true;
+                break;
+            default: github_token_settings(cfg);
+        }
     }
 }
 
@@ -1318,7 +1682,7 @@ bool pick_job(const Platform& p, const Config& cfg, Job& job) {
             }
         }
         std::cout << "\n " << paint(DIM, "Lower is faster, but gets rate limited more.") << "\n";
-        job.delay = ask_seconds("Seconds between checks", p.delay);
+        job.delay = ask_seconds("Seconds between requests", p.delay);
         return true;
     }
 }
@@ -1471,8 +1835,9 @@ void run(const Platform& p, const Job& job, Config& cfg) {
     const size_t total = job.names.size();
     bool use_webhook = !cfg.webhook.empty();
     std::cout << " Checking " << paint(BOLD, std::to_string(total)) << " name" << (total == 1 ? "" : "s") << " on "
-              << p.name << ", " << format_seconds(job.delay) << "s apart. " << paint(DIM, "Ctrl+C stops early.") << "\n"
-              << " " << paint(DIM, std::string("Hits get saved to ") + RESULTS_FILE +
+              << p.name << ", " << format_seconds(job.delay) << "s apart. " << paint(DIM, "Ctrl+C stops early.") << "\n";
+    if (p.lookup) std::cout << " " << paint(DIM, "Up to " + std::to_string(p.batch) + " names per request.") << "\n";
+    std::cout << " " << paint(DIM, std::string("Hits get saved to ") + RESULTS_FILE +
                                        (use_webhook ? " and posted to your Discord webhook." : "."))
               << "\n";
     for (const std::string& w : job.warnings) std::cout << " " << paint(YELLOW, w) << "\n";
@@ -1510,18 +1875,69 @@ void run(const Platform& p, const Job& job, Config& cfg) {
     };
     // For sites that rate limit without saying how long: 15s, then 30s, 1m... up to 10m.
     double backoff = 15;
+    auto wait_for = [&](const Result& limited) {
+        if (limited.retry_after > 0) {
+            wait_out(limited.retry_after + 0.5);
+        } else {
+            wait_out(backoff);
+            backoff = std::min(backoff * 2, 600.0);
+        }
+    };
+
+    // Keeps requests job.delay apart, counting from when the last one finished. Names a batch
+    // lookup already answered don't need a request, so they don't wait.
+    steady_clock::time_point last_request;
+    bool sent = false;
+    auto pace = [&] {
+        if (sent) nap(job.delay - duration<double>(steady_clock::now() - last_request).count(), [&] { bar.draw(); });
+    };
+    auto sent_now = [&] {
+        sent = true;
+        last_request = steady_clock::now();
+    };
+
+    std::set<std::string> found;  // lowercased names the current batch lookup found
+    size_t looked_up = 0;         // names before this index have had a batch lookup
+    bool lookup_failed = false;   // the current batch gets checked one name at a time instead
 
     for (size_t i = 0; i < total && !g_stop; ++i) {
         const std::string& name = job.names[i];
-        Result res = p.check(name);
-        while (res.state == State::RateLimited && !g_stop) {
-            if (res.retry_after > 0) {
-                wait_out(res.retry_after + 0.5);
-            } else {
-                wait_out(backoff);
-                backoff = std::min(backoff * 2, 600.0);
+        if (p.lookup && i == looked_up) {
+            const std::vector<std::string> batch(job.names.begin() + i, job.names.begin() + std::min(total, i + p.batch));
+            looked_up += batch.size();
+            found.clear();
+            Result why;
+            for (;;) {
+                pace();
+                lookup_failed = !p.lookup(batch, found, why);
+                sent_now();
+                if (!lookup_failed || why.state != State::RateLimited || g_stop) break;
+                wait_for(why);
+                if (g_stop) break;
             }
-            if (!g_stop) res = p.check(name);
+            if (g_stop) break;
+            if (lookup_failed) {
+                bar.print(" " + paint(YELLOW, fit("Batch lookup failed (" + plain_text(why.detail) +
+                                                      "), checking these one at a time.",
+                                                  bar.width)));
+            }
+        }
+
+        Result res{State::Error, ""};
+        const bool batched = p.lookup && !lookup_failed;
+        if (batched && found.count(to_lower(name))) {
+            res = {State::Taken, ""};
+        } else if (batched && !p.confirm) {
+            res = {State::Available, ""};
+        } else {
+            for (;;) {
+                pace();
+                res = p.check(name);
+                sent_now();
+                if (res.state != State::RateLimited || g_stop) break;
+                wait_for(res);
+                if (g_stop) break;
+            }
         }
         if (g_stop) break;
         backoff = 15;
@@ -1576,7 +1992,6 @@ void run(const Platform& p, const Job& job, Config& cfg) {
                 report(YELLOW, "error", res.detail);
         }
         bar.draw();
-        if (i + 1 < total) nap(job.delay, [&] { bar.draw(); });
     }
 
     bar.finish();

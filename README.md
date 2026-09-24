@@ -1,7 +1,7 @@
 # ringer (formerly usercheck)
 to finally show your friends you have atleast something cool
 
-Finds unclaimed usernames on Discord, Roblox, Minecraft, GitHub, or any site you give it a profile URL for, and can ping you on Discord when it finds one.
+Finds unclaimed usernames on Discord, Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab, or any site you give it a profile URL for, and can ping you on Discord when it finds one.
 
 ringer used to be called **usercheck**. Same tool, new name and a new look. If you have a `usercheck.cfg` from back then, ringer still reads your webhook settings from it.
 
@@ -51,11 +51,13 @@ Windows uses WinHTTP, which is built into Windows, so there's nothing extra to i
 
 Every screen has a header showing where you are (like `ringer > Discord > Random 4 letters`). Type the number next to what you want and press Enter. `0` goes back, or quits from the main screen.
 
-1. Pick an app: Discord, Roblox, or Other apps (Minecraft, GitHub, or a custom site URL)
+1. Pick an app: Discord, Roblox, or Other apps (Minecraft, GitHub, Lichess, Chess.com, GitLab, or a custom site URL)
 2. Pick what to check:
    - names from a `.txt` file (one per line, you can drag the file into the window)
    - random 3/4/5 letters or 3/4/5 characters (letters, numbers, and whatever symbols that app allows)
    - random, any length you pick
+
+   Then how many seconds to wait between requests. Each app has a sensible default, just press Enter.
 3. Watch the results scroll past with a progress bar underneath showing how far along it is, how many it's found, and roughly how long is left. If the site rate limits you, the bar counts down the wait (see [Rate limits](#rate-limits)).
 4. Hits show up in green, beep, get saved to `available.txt`, and get posted to your Discord webhook if you set one up.
 5. When it's done you get a summary card: how many were available, taken, not allowed, or errored, how long it took, and the names it found.
@@ -75,6 +77,16 @@ Pick **Webhook pings** on the main screen:
 Treat the webhook URL like a password. Anyone who has it can post in that channel. `ringer.cfg` (and the old `usercheck.cfg`) are in `.gitignore` so they won't get committed by accident.
 
 If there's no `ringer.cfg` yet, ringer reads `usercheck.cfg` instead. The first time you change a webhook setting, ringer writes `ringer.cfg` and uses that from then on. The old file is left alone, so delete it yourself once you've moved over, because it still has your webhook URL in it.
+
+## GitHub token
+
+Without a token, ringer checks GitHub by loading profile pages. With one, it uses GitHub's API instead, which allows 5,000 checks an hour.
+
+1. On github.com: Settings > Developer settings > Personal access tokens > Fine-grained tokens > Generate new token. It doesn't need any permissions, the defaults are fine.
+2. In ringer: Other apps > GitHub token > Set token, and paste it in
+3. ringer checks it with GitHub, and if it works it's saved to `ringer.cfg`
+
+Treat the token like a password. Why not always use the API? Without a token it only allows 60 checks an hour, which is way slower than loading profile pages.
 
 ## Rate limits
 
@@ -99,16 +111,32 @@ What ringer does about it:
 
 The only ways around Discord's limit are rotating through proxies or checking through a logged-in account's token. Both break Discord's rules and can get the IP or the account banned, so ringer doesn't do either.
 
+**Roblox, Minecraft and Lichess** look names up in batches: 100, 10 and 300 per request. Names the lookup finds are taken without another request, so dense name lists (like 4 letters, where nearly everything is taken) fly by. On Roblox, anything the lookup doesn't find still gets checked with sign-up validation one at a time, so hits are slower than misses.
+
+**Chess.com** has two checks, like Discord. Its public API is the main one and doesn't mind a steady stream of requests. Names it has no account for get double-checked with the sign-up form's check, which also catches banned words, but that one only allows about 4 checks before a roughly one minute wait. While it's waiting, hits are marked **not double-checked**. The public API counts closed accounts, so those hits are still very likely free.
+
+**GitLab** allows about 20 checks a minute, so ringer waits 3 seconds between them by default.
+
 ## How it checks
 
 | App | How | How much to trust "available" |
 |---|---|---|
-| Roblox | Roblox's sign-up validation endpoint | High, it's the same check sign-up uses |
+| Roblox | Roblox's user lookup, 100 names per request, then sign-up validation for anything it doesn't find | High, it's the same check sign-up uses |
 | Discord | Discord's sign-up username suggestions, then its sign-up "is this taken" check for anything that looks free. No login or token needed | High when double-checked. Hits marked "not double-checked" are very likely free but only the first check saw them |
-| Minecraft | Mojang profile lookup | Medium, recently changed and banned names show as free |
-| GitHub | Profile page 404 | Medium, reserved/deleted names 404 too |
+| Minecraft | Mojang's bulk profile lookup, 10 names per request | Medium, recently changed and banned names show as free |
+| GitHub | GitHub's API if you've set a token, otherwise the profile page | Medium, reserved/deleted names come back as not found too |
+| Lichess | Lichess' user lookup, 300 names per request. Closed accounts count as taken | High, Lichess never frees a name. It does turn down some offensive names at sign-up that ringer can't see |
+| Chess.com | Chess.com's public API, then the sign-up form's check for anything with no account | High when double-checked (it catches banned words too). "Not double-checked" hits have no account, closed ones included |
+| GitLab | The check GitLab's sign-up form uses. Covers groups too, since they share names with users | High. Names GitLab keeps for its own pages show as not allowed |
 | Custom | Profile URL 404 | Depends on the site, test with a name you know exists first |
 
 ## Reality check
 
 Every 3-letter and 3-character name on Discord and Roblox is gone, and so is basically every 4-letter one. Running those modes will mostly show `taken`. 4-character names with numbers/symbols turn up the odd hit, and 5-letter gibberish is wide open on Discord.
+
+From test runs in September 2026, some places that aren't picked clean yet:
+
+- Roblox: about 1 in 3 random 5-character names
+- Lichess: over half of random 4-letter names
+- GitLab: about 3 in 4 random 4-letter names
+- Minecraft and Chess.com: most random 5-letter names
