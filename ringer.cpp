@@ -48,6 +48,11 @@ namespace {
 const char* USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+// Tests build with -DDISCORD_API=... to point this at a fake server.
+#ifndef DISCORD_API
+#  define DISCORD_API "https://discord.com/api/v9"
+#endif
+
 const char* RESULTS_FILE = "available.txt";
 const char* UNCHECKED_FILE = "unchecked.txt";  // what a stopped .txt file run didn't get to
 const char* CONFIG_FILE = "ringer.cfg";
@@ -487,7 +492,8 @@ enum class State { Available, Taken, Invalid, Error, RateLimited };
 struct Result {
     State state;
     std::string detail;
-    double retry_after = 0;  // for RateLimited: seconds the site asked for, 0 if it didn't say
+    double retry_after = 0;    // for RateLimited: seconds the site asked for, 0 if it didn't say
+    bool unconfirmed = false;  // for Available: only the looser check saw it (see check_discord)
 };
 
 struct Platform {
@@ -526,8 +532,9 @@ Result check_profile_url(const std::string& url) {
     return {State::Error, "HTTP " + std::to_string(r.status)};
 }
 
-Result check_discord(const std::string& u) {
-    Response r = http("POST", "https://discord.com/api/v9/unique-username/username-attempt-unauthed",
+// Discord's sign-up check, the one that decides whether you can register a name.
+Result discord_attempt(const std::string& u) {
+    Response r = http("POST", DISCORD_API "/unique-username/username-attempt-unauthed",
                       "{\"username\":" + json_quote(u) + "}");
     Result out;
     if (common_result(r, out)) return out;
@@ -542,6 +549,62 @@ Result check_discord(const std::string& u) {
         return {State::Invalid, msg};
     }
     return {State::Error, http_error(r)};
+}
+
+// One of Discord's endpoints, and when its rate limit ends.
+struct Lane {
+    std::chrono::steady_clock::time_point resting_until{};
+
+    double left() const {
+        return std::max(0.0, std::chrono::duration<double>(resting_until - std::chrono::steady_clock::now()).count());
+    }
+    bool open() const { return left() <= 0; }
+    void rest(double seconds) {  // 0 means the server didn't say how long
+        resting_until = std::chrono::steady_clock::now() +
+                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                            std::chrono::duration<double>(seconds > 0 ? seconds + 0.5 : 15));
+    }
+};
+
+Lane g_discord_suggest, g_discord_attempt;
+
+// Discord has two public sign-up endpoints that can tell whether a name is free, each with its
+// own rate limit (measured Sept 2026: ~37 checks, then a ~36 minute wait; ~20, then ~35 minutes):
+//  - username-suggestions-unauthed hands back the name you asked for if it's free, or a variant
+//    like "abcd." or "abcd0288" if it's taken. It allows more checks, so every name goes through
+//    it first.
+//  - username-attempt-unauthed (discord_attempt) is what sign-up enforces, so it's saved for
+//    double-checking names that look free.
+// While one is rate limited the other carries on alone. A name that looks free while the
+// double-check is resting still counts as a hit, marked unconfirmed.
+Result check_discord(const std::string& u) {
+    bool looks_free = false;
+    if (g_discord_suggest.open()) {
+        Response r = http("GET", DISCORD_API "/unique-username/username-suggestions-unauthed?global_name=" +
+                                     url_encode(u));
+        std::string suggestion;
+        if (r.status == 429) {
+            g_discord_suggest.rest(retry_after_seconds(r));
+        } else if (r.status == 0) {
+            return {State::Error, r.error};
+        } else if (r.status == 200 && json_get(r.body, "username", suggestion)) {
+            if (suggestion != u) return {State::Taken, ""};
+            looks_free = true;
+        } else {
+            return {State::Error, http_error(r)};
+        }
+    }
+    if (g_discord_attempt.open()) {
+        Result res = discord_attempt(u);
+        if (res.state != State::RateLimited) return res;
+        g_discord_attempt.rest(res.retry_after);
+    }
+    if (looks_free) {
+        Result res{State::Available, "not double-checked, main check is rate limited"};
+        res.unconfirmed = true;
+        return res;
+    }
+    return {State::RateLimited, "", std::min(g_discord_suggest.left(), g_discord_attempt.left())};
 }
 
 bool valid_discord(const std::string& u) {
@@ -586,10 +649,11 @@ bool valid_github(const std::string& u) {
 
 Platform discord_platform() {
     return {"Discord", LOWER + DIGITS + "_.", valid_discord, check_discord, 1.5,
-            "Uses the same public check as Discord's sign-up page. Discord only lets each "
-            "internet connection check a handful of names (around 20) before making it wait, "
-            "sometimes for over half an hour, so big runs take hours. ringer waits it out and "
-            "carries on by itself."};
+            "Checks each name with Discord's sign-up suggestions first, then double-checks anything "
+            "that looks free with the check sign-up actually uses. Each has its own limit (roughly "
+            "35-40 and 20 checks, then a wait of around half an hour), so together they get through "
+            "2-3x as many names as before. While the main check is waiting, hits are marked "
+            "\"not double-checked\" and the run keeps going."};
 }
 
 Platform roblox_platform() {
@@ -1263,9 +1327,9 @@ bool pick_job(const Platform& p, const Config& cfg, Job& job) {
 // The checking loop
 // ---------------------------------------------------------------------------
 
-void save_hit(const std::string& platform, const std::string& name) {
+void save_hit(const std::string& platform, const std::string& name, bool unconfirmed) {
     std::ofstream f(RESULTS_FILE, std::ios::app);
-    f << platform << ": " << name << "\n";
+    f << platform << ": " << name << (unconfirmed ? " (not double-checked)" : "") << "\n";
 }
 
 // The live progress line under a run's results:
@@ -1337,7 +1401,8 @@ struct ProgressBar {
 
 struct Tally {
     size_t checked = 0, taken = 0, invalid = 0, errors = 0, rate_limits = 0, pings = 0;
-    std::vector<std::string> found;
+    std::vector<std::string> found;  // unconfirmed ones end in '?'
+    size_t unconfirmed = 0;
     double seconds = 0, rate_waited = 0;
     bool stopped = false;
     std::string webhook_error;
@@ -1386,6 +1451,9 @@ void print_summary(const Platform& p, size_t total, const Tally& t, bool webhook
         }
         for (size_t i = 0; i < rows.size(); ++i) row(i ? "" : "Found", paint(std::string(GREEN) + BOLD, rows[i]));
         if (listed < t.found.size()) row("", paint(DIM, "and " + std::to_string(t.found.size() - listed) + " more"));
+        if (t.unconfirmed) {
+            row("", paint(DIM, fit("? = not double-checked, " + std::to_string(t.unconfirmed) + " of them", room)));
+        }
         row("Saved to", RESULTS_FILE);
     }
     if (t.unchecked_saved) {
@@ -1459,7 +1527,10 @@ void run(const Platform& p, const Job& job, Config& cfg) {
         backoff = 15;
 
         ++t.checked;
-        if (res.state == State::Available) t.found.push_back(name);
+        if (res.state == State::Available) {
+            t.found.push_back(res.unconfirmed ? name + "?" : name);
+            if (res.unconfirmed) ++t.unconfirmed;
+        }
         bar.done = t.checked;
         bar.found = t.found.size();
 
@@ -1475,11 +1546,12 @@ void run(const Platform& p, const Job& job, Config& cfg) {
 
         switch (res.state) {
             case State::Available: {
-                save_hit(p.name, name);
+                save_hit(p.name, name, res.unconfirmed);
                 report(std::string(GREEN) + BOLD, "AVAILABLE", res.detail);
                 std::cout << "\a" << std::flush;
                 if (use_webhook) {
-                    std::string err = webhook_send(cfg, "\xE2\x9C\x85 `" + name + "` is available on **" + p.name + "**");
+                    std::string err = webhook_send(cfg, "\xE2\x9C\x85 `" + name + "` is available on **" + p.name + "**" +
+                                                            (res.unconfirmed ? " (not double-checked)" : ""));
                     if (err.empty()) {
                         ++t.pings;
                     } else {

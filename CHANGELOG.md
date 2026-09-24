@@ -2,6 +2,16 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.1.0
+
+More Discord checks per half hour.
+
+- Discord names are now checked with Discord's sign-up username suggestions first, which has its own rate limit, and only names that look free get double-checked with the sign-up check ringer used before. Together that's roughly 2-3x as many names per half hour (about 37 + 20 before the long wait, instead of 20).
+- If the double-check is rate limited, hits still show up but are marked "not double-checked" (`name?` in the summary, `(not double-checked)` in `available.txt` and webhook pings) instead of holding up the run.
+- If either check is rate limited the other keeps going on its own. ringer only waits when both are.
+
+Discord is still slow. Plan on something like 50-60 names per half hour.
+
 ## v2.0.0
 
 **usercheck is now ringer.** Same tool, new name and a new look. Download `ringer.exe` below. If you have a `usercheck.cfg` from before, ringer still reads your webhook settings from it.
