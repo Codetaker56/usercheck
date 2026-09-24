@@ -78,6 +78,7 @@ class Run:
         finally:
             server.kill()
             server.wait()
+        self.raw = out.decode(errors="replace")
         # Colors out, and every redraw of a line (\r) on a line of its own.
         self.screen = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out.decode(errors="replace")).replace("\r", "\n")
         self.requests = []
@@ -146,6 +147,13 @@ def main_menu_lists_everything():
     r.expect("[1]  Discord", "[2]  Roblox", "[3]  Other apps", "[4]  Every app", "[5]  Webhook pings", "[0]  Quit")
 
 
+@test
+def new_screens_clear_the_scrollback_too():
+    # Without 3J, Windows Terminal keeps every old screen in the scrollback above the new one.
+    r = Run("5\n0\n0\n")
+    assert r.raw.count("\x1b[H\x1b[2J\x1b[3J") == 3, "main menu, webhook screen, main menu"
+
+
 # --- Discord ----------------------------------------------------------------------------------
 
 @test
@@ -173,7 +181,8 @@ def roblox_looks_up_100_at_a_time_and_falls_back_when_a_batch_fails():
     names = ["Roblox", "takenRB"] + [f"free{i}" for i in range(1, 99)] + ["builderman", "badword"] + \
             [f"free{i}" for i in range(101, 149)]
     r = Run(from_file(ROBLOX, "names.txt"), scenario="roblox_batch_fails", files={"names.txt": "\n".join(names)})
-    r.expect("Up to 100 names per request.", "Batch lookup failed (HTTP 500", "Username not appropriate for Roblox")
+    r.expect("Up to 100 names per request, at most one every 7s (Roblox's limit).", "Batch lookup failed (HTTP 500",
+             "Username not appropriate for Roblox")
     r.expect_summary("146 available", "3 taken", "1 not allowed", "0 errors")
     assert [len(json.loads(q["body"])["usernames"]) for q in r.to("users.roblox.com")] == [100, 50]
     # 98 misses from the first batch get confirmed, and all 50 of the failed one get checked.
@@ -187,6 +196,15 @@ def roblox_matches_names_whatever_the_case():
     assert len(r.to("users.roblox.com")) == 1 and len(r.to("auth.roblox.com")) == 1
 
 
+@test
+def roblox_lookups_are_7_seconds_apart():
+    # Roblox's lookup starts answering 429 at 5s apart, even when the run's own delay is shorter.
+    names = ["Roblox"] + [f"taken{i}" for i in range(249)]
+    r = Run(from_file(ROBLOX, "names.txt"), files={"names.txt": "\n".join(names)}, timeout=60)
+    times = [q["t"] for q in r.to("users.roblox.com")]
+    assert len(times) == 3 and all(b - a >= 6.9 for a, b in zip(times, times[1:])), times
+
+
 # --- Minecraft --------------------------------------------------------------------------------
 
 @test
@@ -196,6 +214,16 @@ def minecraft_looks_up_10_at_a_time():
     r.expect_summary("24 available", "3 taken")
     assert [len(json.loads(q["body"])) for q in r.to("api.minecraftservices.com")] == [10, 10, 7]
     assert not r.to("api.mojang.com"), "no one-name lookups when the batches work"
+
+
+@test
+def time_left_counts_down_by_requests():
+    # 60 names, 10 per request, 1s apart: after the first request, 5 more are left, so about 4s.
+    # Going by names instead said ~0s there, then climbed during every wait.
+    r = Run(f"{MINECRAFT}\n1\nnames.txt\n1\n0\n", files={"names.txt": "".join(f"free{i}\n" for i in range(60))})
+    shown = [int(m or 0) * 60 + int(s) for m, s in re.findall(r"~(?:(\d+)m )?(\d+)s left", r.screen)]
+    assert shown and 3 <= shown[0] <= 6, shown
+    assert all(b <= a for a, b in zip(shown, shown[1:])), f"went back up: {shown}"
 
 
 # --- Lichess ----------------------------------------------------------------------------------

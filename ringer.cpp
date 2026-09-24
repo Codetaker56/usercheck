@@ -118,7 +118,10 @@ int console_width() {
 
 void clear_screen() {
     if (g_vt) {
-        std::cout << "\033[2J\033[H" << std::flush;
+        // 2J only clears the window. Windows Terminal and newer Windows consoles push what was on
+        // it into the scrollback, so every old screen piles up above the new one. 3J clears the
+        // scrollback too, like cls does.
+        std::cout << "\033[H\033[2J\033[3J" << std::flush;
         return;
     }
     std::cout << std::flush;
@@ -580,8 +583,9 @@ struct Platform {
     // The rest count as available, or go through `check` first if `confirm` is set. If a lookup
     // fails for any reason other than a rate limit, its names go through `check` one at a time.
     Lookup lookup = nullptr;
-    size_t batch = 0;  // most names per lookup
+    size_t batch = 0;        // most names per lookup
     bool confirm = false;
+    double lookup_gap = 0;   // least seconds between lookups, for sites that allow fewer of those
 };
 
 // Handles the answers every check treats the same: no response, and rate limits.
@@ -974,10 +978,14 @@ Platform roblox_platform() {
     Platform p{"Roblox", LOWER + DIGITS + "_", valid_roblox, check_roblox, 0.5,
                "Looks names up 100 at a time, then runs anything that isn't an existing account "
                "through Roblox's sign-up validation, so 'available' means Roblox would actually "
-               "let you register it."};
+               "let you register it. Roblox only allows about one lookup every 7 seconds, so "
+               "ringer spaces them out."};
     p.lookup = lookup_roblox;
     p.batch = 100;
     p.confirm = true;
+    // From one connection the lookup gets a 429 about every 4th request at 5s apart, and says
+    // nothing about how long to wait. 7s apart went 12 for 12 (measured Sept 2026).
+    p.lookup_gap = 7;
     return p;
 }
 
@@ -1766,6 +1774,18 @@ struct ProgressBar {
     size_t bar;           // columns inside the brackets, fixed so the bar doesn't jump around
     std::string shown;    // what's on screen now, so identical redraws can be skipped
 
+    // The time left goes by requests, not names. A batch lookup answers 100 names at once and then
+    // waits before the next request, so "time so far per name" swings all over the place. Instead
+    // it's (requests still needed) x (seconds each one has taken, waits between included). It's
+    // worked out just before each request goes out, when every name the last one answered has been
+    // counted and the wait before it is over, and counts down in between. Rate limit waits don't
+    // count and pause the countdown, since there's no telling if another one's coming.
+    size_t requests = 0;         // requests that got an answer, so not rate limited
+    double request_seconds = 0;  // how long those took, without the waits between them
+    double paused = 0;           // seconds spent waiting out rate limits
+    double eta = -1;      // seconds left as of eta_at, -1 until there's anything to go on
+    std::chrono::steady_clock::time_point eta_at;
+
     explicit ProgressBar(size_t n) : total(n) {
         // Leave room for the longest text this many names can produce.
         const int digits = static_cast<int>(std::to_string(total).size());
@@ -1775,6 +1795,19 @@ struct ProgressBar {
 
     double elapsed() const {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    void update_eta() {
+        if (!requests || !done) return;
+        const double n = static_cast<double>(requests);
+        const double left = static_cast<double>(total - done) / (static_cast<double>(done) / n);  // requests
+        // The next request goes out now, with no wait before it, and there's no wait after the last.
+        eta = std::max(0.0, left - 1) * ((elapsed() - paused) / n) + std::min(left, 1.0) * (request_seconds / n);
+        eta_at = std::chrono::steady_clock::now();
+    }
+
+    double eta_left() const {
+        return std::max(0.0, eta - std::chrono::duration<double>(std::chrono::steady_clock::now() - eta_at).count());
     }
 
     std::string render() const {
@@ -1794,9 +1827,8 @@ struct ProgressBar {
         if (!waiting.empty()) {
             add(waiting, YELLOW);
         } else {
-            double secs = elapsed();
-            add(duration_text(secs), DIM);
-            if (done && done < total) add("~" + duration_text(secs / done * (total - done)) + " left", DIM);
+            add(duration_text(elapsed()), DIM);
+            if (done && done < total && eta >= 0) add("~" + duration_text(eta_left()) + " left", DIM);
         }
         return line + std::string(width + 1 - used, ' ');
     }
@@ -1895,7 +1927,11 @@ void run(const Platform& p, const Job& job, Config& cfg) {
     bool use_webhook = !cfg.webhook.empty();
     std::cout << " Checking " << paint(BOLD, std::to_string(total)) << " name" << (total == 1 ? "" : "s") << " on "
               << p.name << ", " << format_seconds(job.delay) << "s apart. " << paint(DIM, "Ctrl+C stops early.") << "\n";
-    if (p.lookup) std::cout << " " << paint(DIM, "Up to " + std::to_string(p.batch) + " names per request.") << "\n";
+    if (p.lookup) {
+        std::string how = "Up to " + std::to_string(p.batch) + " names per request";
+        if (p.lookup_gap > job.delay) how += ", at most one every " + format_seconds(p.lookup_gap) + "s (" + p.name + "'s limit)";
+        std::cout << " " << paint(DIM, how + ".") << "\n";
+    }
     std::cout << " " << paint(DIM, std::string("Hits get saved to ") + RESULTS_FILE +
                                        (use_webhook ? " and posted to your Discord webhook." : "."))
               << "\n";
@@ -1930,6 +1966,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
             bar.draw();
         });
         t.rate_waited += duration<double>(steady_clock::now() - began).count();
+        bar.paused += duration<double>(steady_clock::now() - began).count();
+        bar.eta_at += steady_clock::now() - began;  // the time left doesn't count down while waiting
         bar.waiting.clear();
     };
     // For sites that rate limit without saying how long: 15s, then 30s, 1m... up to 10m.
@@ -1943,16 +1981,31 @@ void run(const Platform& p, const Job& job, Config& cfg) {
         }
     };
 
-    // Keeps requests job.delay apart, counting from when the last one finished. Names a batch
-    // lookup already answered don't need a request, so they don't wait.
-    steady_clock::time_point last_request;
-    bool sent = false;
-    auto pace = [&] {
-        if (sent) nap(job.delay - duration<double>(steady_clock::now() - last_request).count(), [&] { bar.draw(); });
+    // Keeps requests job.delay apart, and lookups p.lookup_gap apart too, counting from when the
+    // last one finished. Names a batch lookup already answered don't need a request, so they don't
+    // wait. The time left gets worked out once the wait is over.
+    steady_clock::time_point last_request, last_lookup, asked;
+    bool sent = false, looked = false;
+    auto wait_since = [&](steady_clock::time_point since, double seconds) {
+        nap(seconds - duration<double>(steady_clock::now() - since).count(), [&] { bar.draw(); });
     };
-    auto sent_now = [&] {
+    auto pace = [&](bool lookup) {
+        if (sent) wait_since(last_request, job.delay);
+        if (lookup && looked) wait_since(last_lookup, p.lookup_gap);
+        bar.update_eta();
+        asked = steady_clock::now();
+    };
+    auto sent_now = [&](bool lookup, bool answered) {
         sent = true;
         last_request = steady_clock::now();
+        if (lookup) {
+            looked = true;
+            last_lookup = last_request;
+        }
+        if (answered) {
+            ++bar.requests;
+            bar.request_seconds += duration<double>(last_request - asked).count();
+        }
     };
 
     std::set<std::string> found;  // lowercased names the current batch lookup found
@@ -1967,9 +2020,9 @@ void run(const Platform& p, const Job& job, Config& cfg) {
             found.clear();
             Result why;
             for (;;) {
-                pace();
+                pace(true);
                 lookup_failed = !p.lookup(batch, found, why);
-                sent_now();
+                sent_now(true, !lookup_failed || why.state != State::RateLimited);
                 if (!lookup_failed || why.state != State::RateLimited || g_stop) break;
                 wait_for(why);
                 if (g_stop) break;
@@ -1990,9 +2043,9 @@ void run(const Platform& p, const Job& job, Config& cfg) {
             res = {State::Available, ""};
         } else {
             for (;;) {
-                pace();
+                pace(false);
                 res = p.check(name);
-                sent_now();
+                sent_now(false, res.state != State::RateLimited);
                 if (res.state != State::RateLimited || g_stop) break;
                 wait_for(res);
                 if (g_stop) break;
