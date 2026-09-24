@@ -2,6 +2,12 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.3.0
+
+- **GitHub with a token looks names up 100 at a time** using GitHub's GraphQL API. Each lookup counts as one of the 5,000 an hour, so in practice the limit stops mattering. It checks organizations too, since they share names with users.
+- If a batch lookup ever fails, that batch is checked one name at a time with the regular API instead, so runs don't stall.
+- Without a token, nothing changes: GitHub is still checked with profile pages.
+
 ## v2.2.0
 
 Much faster Roblox and Minecraft, a GitHub token option, and three new apps.
