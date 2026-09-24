@@ -22,17 +22,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
-      - run: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -static usercheck.cpp -o usercheck.exe -lwinhttp
+      - run: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -static ringer.cpp -o ringer.exe -lwinhttp
       - uses: actions/upload-artifact@v4
         with:
-          name: usercheck-windows
-          path: usercheck.exe
+          name: ringer-windows
+          path: ringer.exe
       - if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          files: usercheck.exe
+          files: ringer.exe
 
   # Makes sure the CMake build works everywhere (MSVC on Windows).
   cmake:

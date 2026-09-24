@@ -1,5 +1,7 @@
 available.txt
+ringer.cfg
+# the old name for ringer.cfg, still read if ringer.cfg does not exist yet
 usercheck.cfg
 build/
-usercheck
-usercheck.exe
+ringer
+ringer.exe
