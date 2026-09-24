@@ -135,7 +135,7 @@ What ringer does about it:
 
 The only ways around Discord's limit are rotating through proxies or checking through a logged-in account's token. Both break Discord's rules and can get the IP or the account banned, so ringer doesn't do either.
 
-**Roblox, Minecraft, Lichess and GitHub** (with a token) look names up in batches: 100, 10, 300 and 100 per request. Names the lookup finds are taken without another request, so dense name lists (like 4 letters, where nearly everything is taken) fly by. On Roblox, anything the lookup doesn't find still gets checked with sign-up validation one at a time, so hits are slower than misses.
+**Roblox, Minecraft, Lichess and GitHub** (with a token) look names up in batches: 100, 10, 300 and 100 per request. Names the lookup finds are taken without another request, so dense name lists (like 4 letters, where nearly everything is taken) fly by. On Roblox, anything the lookup doesn't find still gets checked with sign-up validation one at a time, so hits are slower than misses. Roblox also only allows about one lookup every 7 seconds from one connection, so ringer spaces them that far apart, whatever you set as seconds between requests.
 
 **Chess.com** has two checks, like Discord. Its public API is the main one and doesn't mind a steady stream of requests. Names it has no account for get double-checked with the sign-up form's check, which also catches banned words, but that one only allows about 4 checks before a roughly one minute wait. While it's waiting, hits are marked **not double-checked**. The public API counts closed accounts, so those hits are still very likely free.
 

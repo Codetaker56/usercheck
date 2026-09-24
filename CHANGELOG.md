@@ -5,6 +5,8 @@ Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 ## v2.4.1
 
 - Fixed: moving to a new screen now really clears the window. In Windows Terminal and newer Windows consoles, every old screen used to pile up in the scroll history above the new one.
+- Fixed: the time left on the progress bar jumped all over the place with batch lookups, guessing too low right after each batch and climbing during every wait. It now goes by requests left and how long each one has actually taken, and counts down steadily. On a Roblox run it stayed within a few seconds of the real time.
+- Roblox's batch lookup is now spaced at least 7 seconds apart. Faster than that, Roblox answered every few requests with a "too many requests" that ringer waited 15 seconds out, so runs are smoother and usually quicker. 2000 random 4-character names take about 2.5 minutes.
 
 ## v2.4.0
 
