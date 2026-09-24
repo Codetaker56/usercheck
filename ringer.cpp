@@ -118,7 +118,10 @@ int console_width() {
 
 void clear_screen() {
     if (g_vt) {
-        std::cout << "\033[2J\033[H" << std::flush;
+        // 2J only clears the window. Windows Terminal and newer Windows consoles push what was on
+        // it into the scrollback, so every old screen piles up above the new one. 3J clears the
+        // scrollback too, like cls does.
+        std::cout << "\033[H\033[2J\033[3J" << std::flush;
         return;
     }
     std::cout << std::flush;

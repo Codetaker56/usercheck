@@ -2,6 +2,10 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.4.1
+
+- Fixed: moving to a new screen now really clears the window. In Windows Terminal and newer Windows consoles, every old screen used to pile up in the scroll history above the new one.
+
 ## v2.4.0
 
 - **New: Every app.** Type a name, or a few, and ringer checks each one on Discord, Roblox, Minecraft, GitHub, Lichess, Chess.com and GitLab, then sums up where each one is free.

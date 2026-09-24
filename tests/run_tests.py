@@ -78,6 +78,7 @@ class Run:
         finally:
             server.kill()
             server.wait()
+        self.raw = out.decode(errors="replace")
         # Colors out, and every redraw of a line (\r) on a line of its own.
         self.screen = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", out.decode(errors="replace")).replace("\r", "\n")
         self.requests = []
@@ -144,6 +145,13 @@ def test(fn):
 def main_menu_lists_everything():
     r = Run("0\n")
     r.expect("[1]  Discord", "[2]  Roblox", "[3]  Other apps", "[4]  Every app", "[5]  Webhook pings", "[0]  Quit")
+
+
+@test
+def new_screens_clear_the_scrollback_too():
+    # Without 3J, Windows Terminal keeps every old screen in the scrollback above the new one.
+    r = Run("5\n0\n0\n")
+    assert r.raw.count("\x1b[H\x1b[2J\x1b[3J") == 3, "main menu, webhook screen, main menu"
 
 
 # --- Discord ----------------------------------------------------------------------------------
