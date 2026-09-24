@@ -13,9 +13,23 @@ on:
         default: ""
 
 jobs:
+  # Runs ringer against a fake version of every site it checks (tests/fake_server.py).
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r tests/requirements.txt
+      - run: python3 tests/run_tests.py
+
   # Ready-to-run Windows .exe, no DLLs needed. Pushing a v* tag, or running this
-  # workflow by hand with a release tag, publishes it as a GitHub release.
+  # workflow by hand with a release tag, publishes it as a GitHub release, but
+  # only once the tests pass.
   windows-exe:
+    needs: tests
     runs-on: ubuntu-latest
     permissions:
       contents: write
