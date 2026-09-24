@@ -2,6 +2,13 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.4.0
+
+- **New: Every app.** Type a name, or a few, and ringer checks each one on Discord, Roblox, Minecraft, GitHub, Lichess, Chess.com and GitLab, then sums up where each one is free.
+- Rate limits of a minute or less get waited out. Longer ones skip that app for the rest of the run, so a Discord wait doesn't hold up the others.
+- Hits get saved to `available.txt`, and webhook pings come one per name, listing every app it's free on.
+- Webhook pings moved from 4 to 5 on the main menu.
+
 ## v2.3.0
 
 - **GitHub with a token looks names up 100 at a time** using GitHub's GraphQL API. Each lookup counts as one of the 5,000 an hour, so in practice the limit stops mattering. It checks organizations too, since they share names with users.
