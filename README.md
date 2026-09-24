@@ -80,13 +80,15 @@ If there's no `ringer.cfg` yet, ringer reads `usercheck.cfg` instead. The first 
 
 ## GitHub token
 
-Without a token, ringer checks GitHub by loading profile pages. With one, it uses GitHub's API instead, which allows 5,000 checks an hour.
+Without a token, ringer checks GitHub by loading profile pages, one name at a time. With one, it uses GitHub's API instead and looks names up 100 per request.
 
 1. On github.com: Settings > Developer settings > Personal access tokens > Fine-grained tokens > Generate new token. It doesn't need any permissions, the defaults are fine.
 2. In ringer: Other apps > GitHub token > Set token, and paste it in
 3. ringer checks it with GitHub, and if it works it's saved to `ringer.cfg`
 
 Treat the token like a password. Why not always use the API? Without a token it only allows 60 checks an hour, which is way slower than loading profile pages.
+
+If a batch lookup ever fails, ringer checks that batch one name at a time with GitHub's regular API (5,000 an hour) instead, so a run never stalls on it.
 
 ## Rate limits
 
@@ -111,7 +113,7 @@ What ringer does about it:
 
 The only ways around Discord's limit are rotating through proxies or checking through a logged-in account's token. Both break Discord's rules and can get the IP or the account banned, so ringer doesn't do either.
 
-**Roblox, Minecraft and Lichess** look names up in batches: 100, 10 and 300 per request. Names the lookup finds are taken without another request, so dense name lists (like 4 letters, where nearly everything is taken) fly by. On Roblox, anything the lookup doesn't find still gets checked with sign-up validation one at a time, so hits are slower than misses.
+**Roblox, Minecraft, Lichess and GitHub** (with a token) look names up in batches: 100, 10, 300 and 100 per request. Names the lookup finds are taken without another request, so dense name lists (like 4 letters, where nearly everything is taken) fly by. On Roblox, anything the lookup doesn't find still gets checked with sign-up validation one at a time, so hits are slower than misses.
 
 **Chess.com** has two checks, like Discord. Its public API is the main one and doesn't mind a steady stream of requests. Names it has no account for get double-checked with the sign-up form's check, which also catches banned words, but that one only allows about 4 checks before a roughly one minute wait. While it's waiting, hits are marked **not double-checked**. The public API counts closed accounts, so those hits are still very likely free.
 
@@ -124,7 +126,7 @@ The only ways around Discord's limit are rotating through proxies or checking th
 | Roblox | Roblox's user lookup, 100 names per request, then sign-up validation for anything it doesn't find | High, it's the same check sign-up uses |
 | Discord | Discord's sign-up username suggestions, then its sign-up "is this taken" check for anything that looks free. No login or token needed | High when double-checked. Hits marked "not double-checked" are very likely free but only the first check saw them |
 | Minecraft | Mojang's bulk profile lookup, 10 names per request | Medium, recently changed and banned names show as free |
-| GitHub | GitHub's API if you've set a token, otherwise the profile page | Medium, reserved/deleted names come back as not found too |
+| GitHub | GitHub's API if you've set a token (100 names per request, users and organizations), otherwise the profile page | Medium, reserved/deleted names come back as not found too |
 | Lichess | Lichess' user lookup, 300 names per request. Closed accounts count as taken | High, Lichess never frees a name. It does turn down some offensive names at sign-up that ringer can't see |
 | Chess.com | Chess.com's public API, then the sign-up form's check for anything with no account | High when double-checked (it catches banned words too). "Not double-checked" hits have no account, closed ones included |
 | GitLab | The check GitLab's sign-up form uses. Covers groups too, since they share names with users | High. Names GitLab keeps for its own pages show as not allowed |

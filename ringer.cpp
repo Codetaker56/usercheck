@@ -750,26 +750,42 @@ Result check_github(const std::string& u) {
     return check_profile_url("https://github.com/" + url_encode(u));
 }
 
-// GitHub's API. With a token it allows 5,000 checks an hour (60 without one, which is why ringer
-// only uses it when there's a token). Running out gets a 403 or 429 that says when checks come back.
-Result check_github_api(const std::string& u, const std::string& token) {
+Options github_auth(const std::string& token) {
     Options opt;
     opt.headers = {"Authorization: Bearer " + token};
-    Response r = http("GET", "https://api.github.com/users/" + url_encode(u), "", opt);
-    if (r.status == 403 || r.status == 429) {
-        double wait = retry_after_seconds(r);
-        if (wait <= 0 && r.header("x-ratelimit-remaining") == "0") {
-            try {
-                // A reset time, so a wrong PC clock skews it. Checks come back within the hour regardless.
-                wait = std::min(std::stod(r.header("x-ratelimit-reset")) - static_cast<double>(std::time(nullptr)) + 1,
-                                3600.0);
-            } catch (const std::exception&) {
-            }
+    return opt;
+}
+
+// How long GitHub wants ringer to wait, or 0 if `r` isn't a rate limit. Running out of checks for
+// the hour comes with a reset time, a short "slow down" limit comes with Retry-After, and when it
+// says neither, GitHub's advice is to wait a minute. Both APIs can say so with a 403 or 429, and
+// GraphQL also with a 200 and a RATE_LIMITED error. That last one is only looked for in GraphQL
+// answers, which hold nothing but logins (no '_' allowed), not in REST ones, which hold bios.
+double github_wait(const Response& r, bool graphql = false) {
+    const bool limited =
+        r.status == 429 ||
+        (r.status == 403 && (!r.header("retry-after").empty() || r.header("x-ratelimit-remaining") == "0" ||
+                             to_lower(r.body).find("rate limit") != std::string::npos)) ||
+        (graphql && r.status == 200 && r.body.find("RATE_LIMITED") != std::string::npos);
+    if (!limited) return 0;
+    double wait = retry_after_seconds(r);
+    if (wait <= 0 && r.header("x-ratelimit-remaining") == "0") {
+        try {
+            // A reset time, so a wrong PC clock skews it. Checks come back within the hour regardless.
+            wait = std::min(std::stod(r.header("x-ratelimit-reset")) - static_cast<double>(std::time(nullptr)) + 1,
+                            3600.0);
+        } catch (const std::exception&) {
         }
-        // GitHub's advice when it doesn't say how long: wait at least a minute.
-        if (wait <= 0 && (r.status == 429 || to_lower(r.body).find("rate limit") != std::string::npos)) wait = 60;
-        if (wait > 0) return {State::RateLimited, "", std::max(wait, 1.0)};
     }
+    return wait > 0 ? std::max(wait, 1.0) : 60;
+}
+
+// GitHub's REST API, one name at a time. With a token it allows 5,000 checks an hour (60 without
+// one, which is why ringer only uses the API when there's a token).
+Result check_github_api(const std::string& u, const std::string& token) {
+    Response r = http("GET", "https://api.github.com/users/" + url_encode(u), "", github_auth(token));
+    const double wait = github_wait(r);
+    if (wait > 0) return {State::RateLimited, "", wait};
     Result out;
     if (common_result(r, out)) return out;
     if (r.status == 404) return {State::Available, "no account found"};
@@ -778,11 +794,49 @@ Result check_github_api(const std::string& u, const std::string& token) {
     return {State::Error, http_error(r)};
 }
 
+// GitHub's GraphQL API asks about up to 100 names in one request, as
+//   query { n_0: repositoryOwner(login: "abc") { login } n_1: ... }
+// and the whole thing costs one point of the 5,000 an hour. repositoryOwner covers users and
+// organizations and is null for a name nobody has. The names are safe to paste into the query
+// because valid_github only lets through letters, numbers and '-'.
+bool lookup_github(const std::vector<std::string>& names, std::set<std::string>& found, Result& why,
+                   const std::string& token) {
+    std::string query = "query {";
+    for (size_t i = 0; i < names.size(); ++i) {
+        query += " n_" + std::to_string(i) + ": repositoryOwner(login: \"" + names[i] + "\") { login }";
+    }
+    query += " }";
+    Response r = http("POST", "https://api.github.com/graphql", "{\"query\":" + json_quote(query) + "}",
+                      github_auth(token));
+    const double wait = github_wait(r, true);
+    if (wait > 0) {
+        why = {State::RateLimited, "", wait};
+        return false;
+    }
+    if (common_result(r, why)) return false;
+    const size_t data = r.body.find("\"data\"");
+    if (r.status != 200 || data == std::string::npos) {
+        why = {State::Error, http_error(r)};
+        return false;
+    }
+    // Every name has to be in the answer, as an account or as null. If one's missing, something's
+    // off, and checking this batch one name at a time beats calling names free that aren't.
+    std::vector<std::string> taken;
+    std::string value;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (!json_get(r.body, "n_" + std::to_string(i), value, data)) {
+            why = {State::Error, "GitHub's answer left some names out"};
+            return false;
+        }
+        if (value != "null") taken.push_back(to_lower(names[i]));
+    }
+    found.insert(taken.begin(), taken.end());
+    return true;
+}
+
 // Asks GitHub whether `token` works, without using up a check. Returns "" if it does.
 std::string github_token_problem(const std::string& token) {
-    Options opt;
-    opt.headers = {"Authorization: Bearer " + token};
-    Response r = http("GET", "https://api.github.com/rate_limit", "", opt);
+    Response r = http("GET", "https://api.github.com/rate_limit", "", github_auth(token));
     if (r.status == 200) return "";
     if (r.status == 0) return r.error;
     if (r.status == 401) return "GitHub says that token isn't valid";
@@ -941,12 +995,17 @@ Platform github_platform(const std::string& token) {
         return {"GitHub", LOWER + DIGITS + "-", valid_github, check_github, 1.5,
                 "Checks whether the profile page exists. Reserved and deleted names can 404 but "
                 "still can't be registered. Add a GitHub token (Other apps > GitHub token) to use "
-                "GitHub's API instead, which allows 5,000 checks an hour."};
+                "GitHub's API instead, which looks names up 100 at a time."};
     }
-    return {"GitHub", LOWER + DIGITS + "-", valid_github,
-            [token](const std::string& u) { return check_github_api(u, token); }, 0.75,
-            "Uses GitHub's API with your token, which allows 5,000 checks an hour. Reserved and "
-            "deleted names come back as not found but still can't be registered."};
+    Platform p{"GitHub", LOWER + DIGITS + "-", valid_github,
+               [token](const std::string& u) { return check_github_api(u, token); }, 0.75,
+               "Uses GitHub's API with your token, looking names up 100 at a time. Reserved and "
+               "deleted names come back as not found but still can't be registered."};
+    p.lookup = [token](const std::vector<std::string>& names, std::set<std::string>& found, Result& why) {
+        return lookup_github(names, found, why, token);
+    };
+    p.batch = 100;
+    return p;
 }
 
 Platform lichess_platform() {
@@ -1462,7 +1521,7 @@ void github_token_settings(Config& cfg) {
         const bool on = !cfg.github_token.empty();
         print_lines(box("GitHub token", {
             paint(DIM, "Status   ") + (on ? paint(GREEN, "on") : "off"),
-            paint(DIM, "Checks   ") + (on ? "GitHub's API, 5,000 an hour" : "profile pages"),
+            paint(DIM, "Checks   ") + (on ? "GitHub's API, 100 names per request" : "profile pages"),
         }, ui_width()));
         std::cout << "\n";
 
@@ -1510,7 +1569,7 @@ bool pick_other_app(Config& cfg, Platform& out) {
         const bool token = !cfg.github_token.empty();
         int pick = menu("Which app?",
                         {{"Minecraft (Java)", limit_hint(cfg, "Minecraft (Java)", "10 per request")},
-                         {"GitHub", limit_hint(cfg, "GitHub", token ? "API, with token" : "profile page")},
+                         {"GitHub", limit_hint(cfg, "GitHub", token ? "100 per request" : "profile page")},
                          {"Lichess", limit_hint(cfg, "Lichess", "300 per request")},
                          {"Chess.com", limit_hint(cfg, "Chess.com", "sign-up check")},
                          {"GitLab", limit_hint(cfg, "GitLab", "sign-up check")},
