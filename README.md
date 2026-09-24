@@ -80,7 +80,16 @@ If there's no `ringer.cfg` yet, ringer reads `usercheck.cfg` instead. The first 
 
 Every site limits how fast you can check names. When one tells ringer to back off, ringer waits exactly as long as the site asks and then keeps going by itself. The progress bar counts down the wait. If a site doesn't say how long, ringer waits 15 seconds, then 30, then a minute, and so on up to 10 minutes.
 
-**Discord is the harsh one.** Its sign-up check only lets each internet connection check a handful of names, around 20, before it makes you wait, and that wait can be over half an hour (one run got told to wait 2117 seconds). No setting in ringer changes that, it's Discord's limit. In practice Discord checks go at roughly 20 names per half hour, so 100 names takes a few hours. Lowering "seconds between checks" just gets you to the wait faster.
+**Discord is the harsh one.** Its sign-up check only lets each internet connection check about 20 names before it makes you wait, and that wait can be over half an hour (one run got told to wait 2117 seconds). No setting in ringer changes that, it's Discord's limit. Lowering "seconds between checks" just gets you to the wait faster.
+
+So ringer uses two of Discord's sign-up endpoints, each with its own limit:
+
+1. **Suggestions** (the one that offers you a username when you sign up). If the name you ask about is free, it hands the same name back. If it's taken, it suggests something else like `abcd.` or `abcd0288`. Every name goes through this first. It allowed about 37 checks before a ~36 minute wait in testing.
+2. **The real sign-up check.** Only names that look free get double-checked here, so its ~20 checks aren't wasted on names that are obviously taken.
+
+When one of them is rate limited, the other keeps going on its own. If the double-check is the one waiting, hits still show up but are marked **not double-checked** (`abcd?` in the summary, `(not double-checked)` in `available.txt` and the webhook ping). In testing the suggestions check never called a taken name free, but it isn't the check Discord actually enforces, so treat those as very likely rather than certain.
+
+Put together that's roughly 2-3x the names per half hour compared to the sign-up check alone. Still not fast: plan on something like 50-60 names per half hour, and big runs taking hours.
 
 What ringer does about it:
 
@@ -95,7 +104,7 @@ The only ways around Discord's limit are rotating through proxies or checking th
 | App | How | How much to trust "available" |
 |---|---|---|
 | Roblox | Roblox's sign-up validation endpoint | High, it's the same check sign-up uses |
-| Discord | Discord's sign-up "is this taken" endpoint, no login or token needed | High, but Discord can still refuse a name when you actually set it |
+| Discord | Discord's sign-up username suggestions, then its sign-up "is this taken" check for anything that looks free. No login or token needed | High when double-checked. Hits marked "not double-checked" are very likely free but only the first check saw them |
 | Minecraft | Mojang profile lookup | Medium, recently changed and banned names show as free |
 | GitHub | Profile page 404 | Medium, reserved/deleted names 404 too |
 | Custom | Profile URL 404 | Depends on the site, test with a name you know exists first |
