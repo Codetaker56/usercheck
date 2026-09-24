@@ -1,2 +1,5 @@
 available.txt
-__pycache__/
+usercheck.cfg
+build/
+usercheck
+usercheck.exe
