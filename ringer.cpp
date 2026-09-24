@@ -1,7 +1,10 @@
-// usercheck: find unclaimed usernames on Discord, Roblox and a few other sites.
+// ringer: find unclaimed usernames on Discord, Roblox and a few other sites.
 //
 // Windows uses WinHTTP, which is built into Windows, so there's nothing to install.
 // Linux and macOS use libcurl.
+//
+// Everything ringer prints is plain ASCII, so it draws the same in every Windows
+// console font, the old raster fonts included.
 
 #include <algorithm>
 #include <atomic>
@@ -15,6 +18,7 @@
 #include <iostream>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,6 +37,8 @@
 #  endif
 #else
 #  include <curl/curl.h>
+#  include <sys/ioctl.h>
+#  include <unistd.h>
 #endif
 
 namespace {
@@ -41,15 +47,20 @@ const char* USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const char* RESULTS_FILE = "available.txt";
-const char* CONFIG_FILE = "usercheck.cfg";
+const char* CONFIG_FILE = "ringer.cfg";
+const char* OLD_CONFIG_FILE = "usercheck.cfg";  // ringer used to be called usercheck
 
+// Colors. setup_console() blanks them if the console can't do escape codes.
+// DIM is dark gray rather than the "faint" code, which the classic Windows console ignores.
 const char* GREEN = "\033[92m";
 const char* RED = "\033[91m";
 const char* YELLOW = "\033[93m";
+const char* GOLD = "\033[33m";
 const char* CYAN = "\033[96m";
-const char* DIM = "\033[2m";
+const char* DIM = "\033[90m";
 const char* BOLD = "\033[1m";
 const char* RESET = "\033[0m";
+bool g_vt = true;  // the console understands escape codes
 
 const std::string LOWER = "abcdefghijklmnopqrstuvwxyz";
 const std::string UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -65,21 +76,56 @@ void on_sigint(int) {
     std::signal(SIGINT, on_sigint);  // Windows resets the handler after each signal
 }
 
-// Sleeps, but wakes up early if Ctrl+C is pressed.
-void nap(double seconds) {
+// Sleeps, but wakes up early if Ctrl+C is pressed. `tick` runs every 100ms while waiting.
+void nap(double seconds, const std::function<void()>& tick = {}) {
     using namespace std::chrono;
     auto end = steady_clock::now() + duration_cast<steady_clock::duration>(duration<double>(seconds));
     while (!g_stop && steady_clock::now() < end) {
+        if (tick) tick();
         std::this_thread::sleep_for(std::min<steady_clock::duration>(milliseconds(100), end - steady_clock::now()));
     }
 }
 
 void setup_console() {
 #ifdef _WIN32
-    SetConsoleOutputCP(CP_UTF8);
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode = 0;
-    if (GetConsoleMode(out, &mode)) SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    if (!GetConsoleMode(out, &mode) || !SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+        // Older than Windows 10, or not a console at all: escape codes would print as junk.
+        g_vt = false;
+        GREEN = RED = YELLOW = GOLD = CYAN = DIM = BOLD = RESET = "";
+    }
+#endif
+}
+
+int console_width() {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) {
+        return info.srWindow.Right - info.srWindow.Left + 1;
+    }
+#else
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
+#endif
+    return 80;
+}
+
+void clear_screen() {
+    if (g_vt) {
+        std::cout << "\033[2J\033[H" << std::flush;
+        return;
+    }
+    std::cout << std::flush;
+#ifdef _WIN32
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (!GetConsoleScreenBufferInfo(out, &info)) return;
+    DWORD cells = static_cast<DWORD>(info.dwSize.X) * static_cast<DWORD>(info.dwSize.Y), written = 0;
+    COORD home = {0, 0};
+    FillConsoleOutputCharacterA(out, ' ', cells, home, &written);
+    FillConsoleOutputAttribute(out, info.wAttributes, cells, home, &written);
+    SetConsoleCursorPosition(out, home);
 #endif
 }
 
@@ -126,6 +172,20 @@ std::string url_encode(const std::string& s) {
             out += hex[c & 15];
         }
     }
+    return out;
+}
+
+// Server messages can contain anything. This keeps them on one line and in plain
+// ASCII, with each non-ASCII character shown as '?'.
+std::string plain_text(const std::string& s) {
+    std::string out;
+    for (unsigned char c : s) {
+        if ((c & 0xC0) == 0x80) continue;  // rest of a UTF-8 character
+        char ch = c >= 0x80 ? '?' : (c < 0x20 || c == 0x7F) ? ' ' : static_cast<char>(c);
+        if (ch == ' ' && (out.empty() || out.back() == ' ')) continue;
+        out += ch;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
     return out;
 }
 
@@ -431,7 +491,7 @@ struct Platform {
     std::string charset;                              // used for random "characters" names
     std::function<bool(const std::string&)> valid;    // local rule check, saves wasted requests
     std::function<Result(const std::string&)> check;
-    double delay;                                     // default seconds between requests
+    double delay = 1.0;                               // default seconds between requests
     std::string note;                                 // caveat shown before checking
 };
 
@@ -523,7 +583,7 @@ bool valid_github(const std::string& u) {
 Platform discord_platform() {
     return {"Discord", LOWER + DIGITS + "_.", valid_discord, check_discord, 1.5,
             "Uses the same public check as Discord's sign-up page. "
-            "Discord rate limits this hard, the checker waits it out automatically."};
+            "Discord rate limits this hard, ringer waits it out automatically."};
 }
 
 Platform roblox_platform() {
@@ -545,11 +605,129 @@ Platform github_platform() {
 }
 
 // ---------------------------------------------------------------------------
-// Prompts
+// Text UI: every screen starts with a breadcrumb header, menus sit in boxes,
+// and it's all laid out to fit an 80-column console.
 // ---------------------------------------------------------------------------
 
+std::string paint(const std::string& color, const std::string& text) {
+    return color + text + RESET;
+}
+
+// Width of the UI in columns, leaving a margin so nothing wraps.
+size_t ui_width() {
+    return static_cast<size_t>(std::max(40, std::min(78, console_width() - 2)));
+}
+
+// How many columns `s` takes on screen, not counting color codes.
+size_t visible_len(const std::string& s) {
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\033') {
+            while (i < s.size() && s[i] != 'm') ++i;
+        } else {
+            ++n;
+        }
+    }
+    return n;
+}
+
+std::string pad(const std::string& s, size_t width) {
+    size_t len = visible_len(s);
+    return len >= width ? s : s + std::string(width - len, ' ');
+}
+
+// Cuts plain text down to `width` columns, marking the cut with "..".
+std::string fit(const std::string& s, size_t width) {
+    if (s.size() <= width) return s;
+    if (width < 3) return s.substr(0, width);
+    return s.substr(0, width - 2) + "..";
+}
+
+std::vector<std::string> wrap(const std::string& text, size_t width) {
+    std::vector<std::string> lines;
+    std::istringstream words(text);
+    std::string word, line;
+    while (words >> word) {
+        if (!line.empty() && line.size() + 1 + word.size() > width) {
+            lines.push_back(line);
+            line.clear();
+        }
+        while (word.size() > width) {
+            lines.push_back(word.substr(0, width));
+            word.erase(0, width);
+        }
+        line += (line.empty() ? "" : " ") + word;
+    }
+    if (!line.empty()) lines.push_back(line);
+    return lines;
+}
+
+void print_lines(const std::vector<std::string>& lines) {
+    for (const std::string& l : lines) std::cout << " " << l << "\n";
+}
+
+// A box `width` columns wide around `lines`, which may carry colors:
+//   +- title -------+
+//   | line          |
+//   +---------------+
+std::vector<std::string> box(const std::string& title, const std::vector<std::string>& lines, size_t width) {
+    const size_t inner = width - 4;
+    std::string top = "+-";
+    size_t used = 2;
+    if (!title.empty()) {
+        std::string t = fit(title, width - 6);
+        top += std::string(RESET) + " " + BOLD + t + RESET + " " + DIM;
+        used += t.size() + 2;
+    }
+    top += std::string(width - 1 - used, '-') + "+";
+
+    std::vector<std::string> out = {paint(DIM, top)};
+    const std::string side = paint(DIM, "|");
+    for (const std::string& l : lines) {
+        std::string shown = visible_len(l) > inner && l.find('\033') == std::string::npos ? fit(l, inner) : l;
+        out.push_back(side + " " + pad(shown, inner) + " " + side);
+    }
+    out.push_back(paint(DIM, "+" + std::string(width - 2, '-') + "+"));
+    return out;
+}
+
+// A box of plain text, word-wrapped to fit the screen.
+void text_box(const std::string& title, const std::string& text) {
+    print_lines(box(title, wrap(text, ui_width() - 4), ui_width()));
+    std::cout << "\n";
+}
+
+std::string g_flash;  // a message for the top of the next screen, e.g. "Webhook saved."
+
+void flash(const char* color, const std::string& msg) {
+    g_flash = paint(color, fit(plain_text(msg), ui_width()));
+}
+
+// Clears the console and draws the header, a box saying where you are:
+//   | ringer > Discord > Random 4 letters |
+void screen(const std::vector<std::string>& crumbs) {
+    clear_screen();
+    const size_t width = ui_width();
+    std::string plain, trail;
+    for (size_t i = 0; i < crumbs.size(); ++i) {
+        if (i) {
+            plain += " > ";
+            trail += paint(DIM, " > ");
+        }
+        plain += crumbs[i];
+        trail += paint(i == 0 ? std::string(CYAN) + BOLD : i + 1 == crumbs.size() ? BOLD : "", crumbs[i]);
+    }
+    if (plain.size() > width - 4) trail = fit(plain, width - 4);
+    print_lines(box("", {trail}, width));
+    std::cout << "\n";
+    if (!g_flash.empty()) {
+        std::cout << " " << g_flash << "\n\n";
+        g_flash.clear();
+    }
+}
+
 std::string read_line(const std::string& prompt) {
-    std::cout << prompt << std::flush;
+    std::cout << " " << prompt << std::flush;
     std::string s;
     if (!std::getline(std::cin, s)) {
         std::cout << "\n";
@@ -558,35 +736,71 @@ std::string read_line(const std::string& prompt) {
     return trim(s);
 }
 
+void say_error(const std::string& msg) {
+    std::cout << " " << paint(RED, msg) << "\n";
+}
+
 bool is_number(const std::string& s) {
     return !s.empty() && s.size() <= 9 && only_chars(s, DIGITS);
 }
 
-// Returns the 0-based index of the picked option.
-size_t ask_choice(const std::string& title, const std::vector<std::string>& options) {
-    std::cout << "\n" << BOLD << title << RESET << "\n";
-    for (size_t i = 0; i < options.size(); ++i) {
-        std::cout << "  " << CYAN << "[" << i + 1 << "]" << RESET << " " << options[i] << "\n";
+struct Option {
+    std::string label;
+    std::string hint;  // shown on the right, may carry colors
+};
+
+// A numbered menu in a box. Options are 1..n and `back`, if given, is 0 at the bottom.
+std::vector<std::string> menu_box(const std::string& title, const std::vector<Option>& options,
+                                  const std::string& back, size_t width) {
+    const size_t inner = width - 4;
+    std::vector<std::string> lines;
+    auto add = [&](const std::string& key, const Option& o) {
+        std::string label = fit(o.label, inner - key.size() - 4);
+        std::string line = paint(CYAN, "[" + key + "]") + "  " + label;
+        size_t used = key.size() + 4 + label.size(), hint = visible_len(o.hint);
+        if (hint && used + 2 + hint <= inner) line += std::string(inner - used - hint, ' ') + paint(DIM, o.hint);
+        lines.push_back(line);
+    };
+    for (size_t i = 0; i < options.size(); ++i) add(std::to_string(i + 1), options[i]);
+    if (!back.empty()) {
+        lines.push_back("");
+        add("0", {back, ""});
     }
+    return box(title, lines, width);
+}
+
+// Reads a menu pick: 1..count, or 0 if the menu has a back option.
+int read_choice(size_t count, bool has_back) {
     for (;;) {
-        std::string raw = read_line("> ");
+        std::string raw = read_line(paint(CYAN, "> "));
         if (is_number(raw)) {
             size_t n = std::stoul(raw);
-            if (n >= 1 && n <= options.size()) return n - 1;
+            if ((n >= 1 && n <= count) || (n == 0 && has_back)) return static_cast<int>(n);
         }
-        std::cout << RED << "Pick a number from 1 to " << options.size() << "." << RESET << "\n";
+        say_error("Type a number from " + std::to_string(has_back ? 0 : 1) + " to " + std::to_string(count) + ".");
     }
+}
+
+// Draws a menu and returns the pick: 1..options.size(), or 0 for `back`.
+int menu(const std::string& title, const std::vector<Option>& options, const std::string& back = "") {
+    size_t width = title.size() + 8;
+    for (const Option& o : options) {
+        width = std::max(width, o.label.size() + (o.hint.empty() ? 0 : visible_len(o.hint) + 2) + 9);
+    }
+    width = std::min(std::max<size_t>(width, 44), ui_width());
+    print_lines(menu_box(title, options, back, width));
+    return read_choice(options.size(), !back.empty());
 }
 
 int ask_int(const std::string& prompt, int def, int lo, int hi) {
     for (;;) {
-        std::string raw = read_line(prompt + " [" + std::to_string(def) + "]: ");
+        std::string raw = read_line(prompt + " " + paint(DIM, "[" + std::to_string(def) + "]") + ": ");
         if (raw.empty()) return def;
         if (is_number(raw)) {
             int n = std::stoi(raw);
             if (n >= lo && n <= hi) return n;
         }
-        std::cout << RED << "Enter a whole number from " << lo << " to " << hi << "." << RESET << "\n";
+        say_error("Enter a whole number from " + std::to_string(lo) + " to " + std::to_string(hi) + ".");
     }
 }
 
@@ -598,7 +812,7 @@ std::string format_seconds(double s) {
 
 double ask_seconds(const std::string& prompt, double def) {
     for (;;) {
-        std::string raw = read_line(prompt + " [" + format_seconds(def) + "]: ");
+        std::string raw = read_line(prompt + " " + paint(DIM, "[" + format_seconds(def) + "]") + ": ");
         if (raw.empty()) return def;
         try {
             size_t used = 0;
@@ -606,8 +820,19 @@ double ask_seconds(const std::string& prompt, double def) {
             if (used == raw.size() && v >= 0 && v <= 3600) return v;
         } catch (const std::exception&) {
         }
-        std::cout << RED << "Enter a number like 0.5 or 2." << RESET << "\n";
+        say_error("Enter a number like 0.5 or 2.");
     }
+}
+
+// 42s, 3m 07s, 2h 05m, 3d 4h
+std::string duration_text(double seconds) {
+    long s = std::lround(std::max(0.0, seconds));
+    char buf[32];
+    if (s < 60) std::snprintf(buf, sizeof buf, "%lds", s);
+    else if (s < 3600) std::snprintf(buf, sizeof buf, "%ldm %02lds", s / 60, s % 60);
+    else if (s < 86400) std::snprintf(buf, sizeof buf, "%ldh %02ldm", s / 3600, s / 60 % 60);
+    else std::snprintf(buf, sizeof buf, "%ldd %ldh", s / 86400, s / 3600 % 24);
+    return buf;
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +847,7 @@ struct Config {
 Config load_config() {
     Config cfg;
     std::ifstream f(CONFIG_FILE);
+    if (!f.is_open()) f.open(OLD_CONFIG_FILE);  // settings saved before the rename
     std::string line;
     while (std::getline(f, line)) {
         size_t eq = line.find('=');
@@ -633,10 +859,11 @@ Config load_config() {
     return cfg;
 }
 
-void save_config(const Config& cfg) {
+bool save_config(const Config& cfg) {
     std::ofstream f(CONFIG_FILE);
     f << "webhook=" << cfg.webhook << "\n" << "mention=" << cfg.mention << "\n";
-    if (!f) std::cout << RED << "Couldn't save " << CONFIG_FILE << "." << RESET << "\n";
+    f.close();
+    return !f.fail();
 }
 
 bool looks_like_webhook(const std::string& url) {
@@ -648,9 +875,9 @@ bool looks_like_webhook(const std::string& url) {
 }
 
 std::string mention_label(const Config& cfg) {
-    if (cfg.mention.empty()) return "no ping";
-    if (cfg.mention == "@everyone") return "pings @everyone";
-    return "pings user " + cfg.mention;
+    if (cfg.mention.empty()) return "nobody, it just posts the name";
+    if (cfg.mention == "@everyone") return "@everyone";
+    return "user " + cfg.mention;
 }
 
 // Posts a message to the webhook, waiting out rate limits. Returns "" on success.
@@ -663,7 +890,7 @@ std::string webhook_send(const Config& cfg, const std::string& text) {
         content = "<@" + cfg.mention + "> " + text;
         allowed = "{\"users\":[" + json_quote(cfg.mention) + "]}";
     }
-    const std::string body = "{\"username\":\"usercheck\",\"content\":" + json_quote(content) +
+    const std::string body = "{\"username\":\"ringer\",\"content\":" + json_quote(content) +
                              ",\"allowed_mentions\":" + allowed + "}";
     for (int attempt = 0; attempt < 5 && !g_stop; ++attempt) {
         Response r = http("POST", cfg.webhook, body);
@@ -679,72 +906,93 @@ std::string webhook_send(const Config& cfg, const std::string& text) {
     return "still rate limited after 5 tries";
 }
 
-void pick_mention(Config& cfg) {
-    size_t who = ask_choice("Who should get pinged when a name is found?",
-                            {"Nobody, just post the name", "@everyone", "A specific person (user ID)"});
-    if (who == 0) {
+// Asks who to ping. Returns false if they backed out.
+bool pick_mention(Config& cfg) {
+    int who = menu("Who gets pinged when a name is found?",
+                   {{"Nobody", "just post the name"}, {"@everyone", ""}, {"One person", "by user ID"}}, "Back");
+    if (who == 0) return false;
+    if (who == 1) {
         cfg.mention.clear();
-    } else if (who == 1) {
+    } else if (who == 2) {
         cfg.mention = "@everyone";
     } else {
-        std::cout << DIM << "Discord: Settings > Advanced > turn on Developer Mode, then right-click "
-                     "the person > Copy User ID." << RESET << "\n";
+        std::cout << "\n " << paint(DIM, "Discord: Settings > Advanced > turn on Developer Mode, then right-click") << "\n"
+                  << " " << paint(DIM, "the person > Copy User ID.") << "\n";
         for (;;) {
-            std::string id = read_line("User ID: ");
+            std::string id = read_line("User ID (blank to go back): ");
+            if (id.empty()) return false;
             if (id.size() >= 15 && id.size() <= 21 && only_chars(id, DIGITS)) {
                 cfg.mention = id;
                 break;
             }
-            std::cout << RED << "That's not a user ID, it should be 17-20 digits." << RESET << "\n";
+            say_error("That's not a user ID, it should be 17-20 digits.");
         }
     }
+    return true;
+}
+
+void set_webhook_url(Config& cfg) {
+    screen({"ringer", "Webhook pings", "Set URL"});
+    text_box("Where to get one",
+             "In Discord: channel settings > Integrations > Webhooks > New Webhook > Copy Webhook URL. "
+             "Treat it like a password, anyone who has it can post in that channel.");
+    std::string url;
+    for (;;) {
+        url = read_line("Webhook URL (blank to go back): ");
+        if (url.empty()) return;
+        if (looks_like_webhook(url)) break;
+        say_error("That doesn't look like a Discord webhook URL.");
+    }
+    Config trial = cfg;
+    trial.webhook = url;
+    std::cout << "\n";
+    if (!pick_mention(trial)) return;
+    std::cout << "\n " << paint(DIM, "Sending a test message...") << std::flush;
+    std::string err = webhook_send(trial, "ringer is hooked up. Available usernames will show up here.");
+    if (!err.empty()) {
+        flash(RED, "Didn't work: " + err);
+        return;
+    }
+    cfg = trial;
+    if (save_config(cfg)) flash(GREEN, "Webhook saved. Check your channel for the test message.");
+    else flash(YELLOW, "The webhook works, but ringer couldn't save it to " + std::string(CONFIG_FILE) + ".");
 }
 
 void webhook_settings(Config& cfg) {
     for (;;) {
-        std::string status = cfg.webhook.empty() ? "off" : "on, " + mention_label(cfg);
-        size_t pick = ask_choice("Discord webhook (" + status + ")",
-                                 {"Set webhook URL", "Change who gets pinged", "Send a test message",
-                                  "Turn off", "Back"});
-        if (pick == 0) {
-            std::cout << DIM << "In Discord: channel settings > Integrations > Webhooks > New Webhook > "
-                         "Copy Webhook URL." << RESET << "\n";
-            std::string url = read_line("Webhook URL: ");
-            if (!looks_like_webhook(url)) {
-                std::cout << RED << "That doesn't look like a Discord webhook URL." << RESET << "\n";
-                continue;
-            }
-            Config trial = cfg;
-            trial.webhook = url;
-            pick_mention(trial);
-            std::cout << "Sending a test message...\n";
-            std::string err = webhook_send(trial, "usercheck is hooked up. Available usernames will show up here.");
-            if (!err.empty()) {
-                std::cout << RED << "Didn't work: " << err << RESET << "\n";
-                continue;
-            }
-            cfg = trial;
-            save_config(cfg);
-            std::cout << GREEN << "Webhook saved. Check your channel for the test message." << RESET << "\n";
-        } else if (pick == 1 || pick == 2) {
-            if (cfg.webhook.empty()) {
-                std::cout << YELLOW << "Set a webhook URL first." << RESET << "\n";
-                continue;
-            }
-            if (pick == 1) {
-                pick_mention(cfg);
-                save_config(cfg);
-            } else {
-                std::string err = webhook_send(cfg, "usercheck test message.");
-                if (err.empty()) std::cout << GREEN << "Sent." << RESET << "\n";
-                else std::cout << RED << "Didn't work: " << err << RESET << "\n";
-            }
+        screen({"ringer", "Webhook pings"});
+        const bool on = !cfg.webhook.empty();
+        print_lines(box("Discord webhook", {
+            paint(DIM, "Status   ") + (on ? paint(GREEN, "on") : "off"),
+            paint(DIM, "Pings    ") + (on ? mention_label(cfg) : "-"),
+        }, ui_width()));
+        std::cout << "\n";
+
+        int pick = menu("What do you want to do?",
+                        {{"Set webhook URL", ""}, {"Change who gets pinged", ""}, {"Send a test message", ""},
+                         {"Turn off", ""}},
+                        "Back");
+        if (pick == 0) return;
+        if (pick == 1) {
+            set_webhook_url(cfg);
+        } else if (!on && (pick == 2 || pick == 3)) {
+            flash(YELLOW, "Set a webhook URL first.");
+        } else if (pick == 2) {
+            screen({"ringer", "Webhook pings", "Who gets pinged"});
+            Config changed = cfg;
+            if (!pick_mention(changed)) continue;
+            cfg = changed;
+            if (save_config(cfg)) flash(GREEN, "Saved.");
+            else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
         } else if (pick == 3) {
-            cfg = Config{};
-            save_config(cfg);
-            std::cout << "Webhook turned off.\n";
+            std::cout << "\n " << paint(DIM, "Sending...") << std::flush;
+            std::string err = webhook_send(cfg, "ringer test message.");
+            if (err.empty()) flash(GREEN, "Sent. Check your channel.");
+            else flash(RED, "Didn't work: " + err);
         } else {
-            return;
+            cfg = Config{};
+            if (save_config(cfg)) flash(GREEN, "Webhook turned off.");
+            else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
         }
     }
 }
@@ -753,23 +1001,30 @@ void webhook_settings(Config& cfg) {
 // Picking the platform and usernames
 // ---------------------------------------------------------------------------
 
-Platform custom_platform() {
-    std::cout << "\n" << CYAN << "Custom site" << RESET << "\n"
-              << "Give a profile URL with {username} where the name goes, for example:\n"
-              << "  " << DIM << "https://example.com/users/{username}" << RESET << "\n"
-              << "A 404 (page not found) is counted as available, a 200 as taken.\n";
+// Asks for a profile URL template. Returns false if they backed out.
+bool custom_platform(Platform& out) {
+    screen({"ringer", "Other apps", "Custom site"});
+    const size_t inner = ui_width() - 4;
+    std::vector<std::string> lines = wrap("Give ringer a profile URL with {username} where the name goes, like:", inner);
+    lines.push_back("  " + paint(CYAN, "https://example.com/users/{username}"));
+    lines.push_back("");
+    lines.push_back("A 404 (page not found) counts as available, a 200 as taken.");
+    print_lines(box("How it works", lines, ui_width()));
+    std::cout << "\n";
+
     std::string tmpl;
     for (;;) {
-        tmpl = read_line("> URL: ");
+        tmpl = read_line("URL (blank to go back): ");
+        if (tmpl.empty()) return false;
         if (tmpl.find("{username}") != std::string::npos &&
             (starts_with(tmpl, "http://") || starts_with(tmpl, "https://"))) {
             break;
         }
-        std::cout << RED << "Needs to start with http(s):// and contain {username}." << RESET << "\n";
+        say_error("Needs to start with http(s):// and contain {username}.");
     }
 
     std::string host = tmpl.substr(tmpl.find("://") + 3);
-    host = host.substr(0, host.find('/'));
+    host = plain_text(host.substr(0, host.find('/')));
 
     auto check = [tmpl](const std::string& u) {
         std::string url = tmpl;
@@ -778,27 +1033,25 @@ Platform custom_platform() {
         return check_profile_url(url);
     };
     auto valid = [](const std::string& u) { return only_chars(u, LOWER + UPPER + DIGITS + "_.-"); };
-    return {host.empty() ? "Custom" : host, LOWER + DIGITS, valid, check, 1.0,
-            "Plenty of sites return 200 for every URL, or 404 for banned names. "
-            "Test it with a name you KNOW exists first."};
+    out = {host.empty() ? "Custom" : host, LOWER + DIGITS, valid, check, 1.0,
+           "Plenty of sites return 200 for every URL, or 404 for banned names. "
+           "Test it with a name you KNOW exists first."};
+    return true;
 }
 
-Platform pick_platform(Config& cfg) {
+// Returns false if they backed out to the main menu.
+bool pick_other_app(Platform& out) {
     for (;;) {
-        std::string hook = cfg.webhook.empty() ? "off" : "on";
-        size_t pick = ask_choice("Which app do you want to check?",
-                                 {"Discord", "Roblox", "Other applications",
-                                  "Discord webhook notifications (" + hook + ")"});
-        if (pick == 0) return discord_platform();
-        if (pick == 1) return roblox_platform();
-        if (pick == 3) {
-            webhook_settings(cfg);
-            continue;
-        }
-        size_t other = ask_choice("Which other app?", {"Minecraft (Java)", "GitHub", "Custom site (any URL)"});
-        if (other == 0) return minecraft_platform();
-        if (other == 1) return github_platform();
-        return custom_platform();
+        screen({"ringer", "Other apps"});
+        int pick = menu("Which app?",
+                        {{"Minecraft (Java)", "Mojang lookup"}, {"GitHub", "profile page"},
+                         {"Custom site", "any profile URL"}},
+                        "Back");
+        if (pick == 0) return false;
+        if (pick == 1) out = minecraft_platform();
+        else if (pick == 2) out = github_platform();
+        else if (!custom_platform(out)) continue;
+        return true;
     }
 }
 
@@ -820,13 +1073,13 @@ std::vector<std::string> random_names(const std::string& charset, int length, in
     return names;
 }
 
-std::vector<std::string> names_from_file(const std::string& path, const Platform& p, bool lowercase) {
+std::vector<std::string> names_from_file(const std::string& path, const Platform& p, bool lowercase, int& skipped) {
     std::ifstream f(path);
     std::vector<std::string> names;
     std::set<std::string> seen;
     std::string line;
-    int skipped = 0;
     bool first = true;
+    skipped = 0;
     while (std::getline(f, line)) {
         if (first && starts_with(line, "\xEF\xBB\xBF")) line.erase(0, 3);  // Notepad's UTF-8 BOM
         first = false;
@@ -840,64 +1093,112 @@ std::vector<std::string> names_from_file(const std::string& path, const Platform
         }
         names.push_back(name);
     }
-    if (skipped) {
-        std::cout << YELLOW << "Skipped " << skipped << " name(s) that break " << p.name
-                  << "'s username rules." << RESET << "\n";
-    }
     return names;
 }
 
-std::vector<std::string> pick_names(const Platform& p) {
+// "a-z 0-9 _ ." for a charset, to show what "characters" means on each app.
+std::string charset_hint(const std::string& charset) {
+    std::string hint, rest;
+    if (charset.find('a') != std::string::npos) hint += "a-z";
+    if (charset.find('0') != std::string::npos) hint += hint.empty() ? "0-9" : " 0-9";
+    for (char c : charset) {
+        if (LOWER.find(c) == std::string::npos && DIGITS.find(c) == std::string::npos) {
+            rest += ' ';
+            rest += c;
+        }
+    }
+    return hint + rest;
+}
+
+struct Job {
+    std::string label;                  // what's being checked, for the header
+    std::vector<std::string> names;
+    std::vector<std::string> warnings;  // shown when the run starts
+    double delay = 1.0;
+};
+
+// Asks what to check and how fast. Returns false if they backed out to the main menu.
+bool pick_job(const Platform& p, Job& job) {
     enum Kind { File, Letters, Chars, Custom };
     struct Mode {
         const char* label;
+        const char* hint;
         Kind kind;
         int length;
     };
     const std::vector<Mode> modes = {
-        {"From a .txt file (one name per line)", File, 0},
-        {"Random 3 letters      (abc)", Letters, 3},
-        {"Random 3 characters   (a1b)", Chars, 3},
-        {"Random 4 letters      (abcd)", Letters, 4},
-        {"Random 4 characters   (a1b2)", Chars, 4},
-        {"Random 5 letters      (abcde)", Letters, 5},
-        {"Random 5 characters   (a1b2c)", Chars, 5},
-        {"Random custom length", Custom, 0},
+        {"From a .txt file", "one name per line", File, 0},
+        {"Random 3 letters", "abc", Letters, 3},
+        {"Random 3 characters", "a1b", Chars, 3},
+        {"Random 4 letters", "abcd", Letters, 4},
+        {"Random 4 characters", "a1b2", Chars, 4},
+        {"Random 5 letters", "abcde", Letters, 5},
+        {"Random 5 characters", "a1b2c", Chars, 5},
+        {"Random, pick the length", "", Custom, 0},
     };
-    std::vector<std::string> labels;
-    for (const Mode& m : modes) labels.push_back(m.label);
-    Mode mode = modes[ask_choice("What kind of usernames?", labels)];
+    std::vector<Option> options;
+    for (const Mode& m : modes) options.push_back({m.label, m.hint});
 
-    if (mode.kind == File) {
-        std::string path;
-        for (;;) {
-            path = read_line("Path to .txt file (you can drag it in here): ");
-            while (!path.empty() && (path.front() == '"' || path.front() == '\'')) path.erase(0, 1);
-            while (!path.empty() && (path.back() == '"' || path.back() == '\'')) path.pop_back();
-            if (std::ifstream(path)) break;
-            std::cout << RED << "Can't find that file." << RESET << "\n";
+    for (;;) {
+        screen({"ringer", p.name});
+        int pick = menu("What kind of usernames?", options, "Back");
+        if (pick == 0) return false;
+        Mode mode = modes[pick - 1];
+        job = Job{};
+        job.label = mode.label;
+
+        screen({"ringer", p.name, job.label});
+        text_box("Heads up", p.note);
+
+        if (mode.kind == File) {
+            std::cout << " " << paint(DIM, "One name per line. Drag the file into this window or type its path.") << "\n";
+            std::string path;
+            for (;;) {
+                path = read_line("File (blank to go back): ");
+                while (!path.empty() && (path.front() == '"' || path.front() == '\'')) path.erase(0, 1);
+                while (!path.empty() && (path.back() == '"' || path.back() == '\'')) path.pop_back();
+                if (path.empty() || std::ifstream(path)) break;
+                say_error("Can't find that file.");
+            }
+            if (path.empty()) continue;
+            // Discord usernames are lowercase only, so lowercase them for the user.
+            int skipped = 0;
+            job.names = names_from_file(path, p, p.name == "Discord", skipped);
+            if (job.names.empty()) {
+                flash(RED, "That file has no names " + p.name + " would allow.");
+                continue;
+            }
+            if (skipped) {
+                job.warnings.push_back("Skipped " + std::to_string(skipped) + " name(s) that break " + p.name +
+                                       "'s username rules.");
+            }
+        } else {
+            if (mode.kind == Custom) {
+                mode.length = ask_int("Length", 6, 1, 32);
+                std::cout << "\n";
+                int pick_chars = menu("Using", {{"Letters only", "a-z"},
+                                                {"Letters, numbers and symbols", charset_hint(p.charset)}},
+                                      "Back");
+                if (pick_chars == 0) continue;
+                mode.kind = pick_chars == 1 ? Letters : Chars;
+                job.label = "Random " + std::to_string(mode.length) + (mode.kind == Letters ? " letters" : " characters");
+                std::cout << "\n";
+            }
+            int count = ask_int("How many to check", 100, 1, 1000000);
+            job.names = random_names(mode.kind == Letters ? LOWER : p.charset, mode.length, count, p);
+            if (job.names.empty()) {
+                flash(RED, p.name + " doesn't allow " + std::to_string(mode.length) + "-character names.");
+                continue;
+            }
+            if (static_cast<int>(job.names.size()) < count) {
+                job.warnings.push_back("Only " + std::to_string(job.names.size()) +
+                                       " names of that type are possible, checking all of them.");
+            }
         }
-        // Discord usernames are lowercase only, so lowercase them for the user.
-        std::vector<std::string> names = names_from_file(path, p, p.name == "Discord");
-        std::cout << "Loaded " << names.size() << " name(s).\n";
-        return names;
+        std::cout << "\n " << paint(DIM, "Lower is faster, but gets rate limited more.") << "\n";
+        job.delay = ask_seconds("Seconds between checks", p.delay);
+        return true;
     }
-
-    if (mode.kind == Custom) {
-        mode.length = ask_int("Length", 6, 1, 32);
-        mode.kind = ask_choice("Using", {"Letters only", "Letters + numbers + symbols"}) == 0 ? Letters : Chars;
-    }
-
-    int count = ask_int("How many to check", 100, 1, 1000000);
-    std::vector<std::string> names =
-        random_names(mode.kind == Letters ? LOWER : p.charset, mode.length, count, p);
-    if (names.empty()) {
-        std::cout << RED << p.name << " doesn't allow " << mode.length << "-character names." << RESET << "\n";
-    } else if (static_cast<int>(names.size()) < count) {
-        std::cout << YELLOW << "Only found " << names.size() << " possible names of that type, checking all of them."
-                  << RESET << "\n";
-    }
-    return names;
 }
 
 // ---------------------------------------------------------------------------
@@ -909,77 +1210,342 @@ void save_hit(const std::string& platform, const std::string& name) {
     f << platform << ": " << name << "\n";
 }
 
-void run(const Platform& p, const std::vector<std::string>& names, const Config& cfg) {
-    double delay = ask_seconds("Seconds between checks (lower = faster but more rate limits)", p.delay);
-    std::cout << "\n" << DIM << p.note << RESET << "\n"
-              << DIM << "Checking " << names.size() << " name(s) on " << p.name << ". Ctrl+C to stop early."
-              << RESET << "\n";
+// The live progress line under a run's results:
+//  [#########..................]   25%  25/100  2 found  37s  ~1m 51s left
+//  [#########..................]   25%  25/100  2 found  rate limited: 12s
+struct ProgressBar {
+    size_t total, done = 0, found = 0;
+    std::string waiting;  // shown instead of the time left while set, e.g. during a rate limit
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    size_t width = ui_width();
+    size_t bar;           // columns inside the brackets, fixed so the bar doesn't jump around
+    std::string shown;    // what's on screen now, so identical redraws can be skipped
+
+    explicit ProgressBar(size_t n) : total(n) {
+        // Leave room for the longest text this many names can produce.
+        const int digits = static_cast<int>(std::to_string(total).size());
+        const int text = 6 + (2 * digits + 3) + (digits + 8) + 9 + 15;
+        bar = static_cast<size_t>(std::max(10, std::min(40, static_cast<int>(width) - 3 - text)));
+    }
+
+    double elapsed() const {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    std::string render() const {
+        const size_t filled = total ? bar * done / total : 0;
+        std::string line = " [" + paint(CYAN, std::string(filled, '#')) + paint(DIM, std::string(bar - filled, '.')) + "]";
+        size_t used = bar + 3;
+        auto add = [&](const std::string& s, const std::string& color) {
+            if (used + 2 + s.size() > width + 1) return;
+            line += "  " + paint(color, s);
+            used += 2 + s.size();
+        };
+        char pct[8];
+        std::snprintf(pct, sizeof pct, "%3d%%", static_cast<int>(total ? 100 * done / total : 0));
+        add(pct, BOLD);
+        add(std::to_string(done) + "/" + std::to_string(total), "");
+        add(std::to_string(found) + " found", found ? GREEN : "");
+        if (!waiting.empty()) {
+            add(waiting, YELLOW);
+        } else {
+            double secs = elapsed();
+            add(duration_text(secs), DIM);
+            if (done && done < total) add("~" + duration_text(secs / done * (total - done)) + " left", DIM);
+        }
+        return line + std::string(width + 1 - used, ' ');
+    }
+
+    void draw() {
+        std::string line = render();
+        if (line == shown) return;
+        std::cout << "\r" << line << std::flush;
+        shown = line;
+    }
+
+    // Prints a line above the bar.
+    void print(const std::string& line) {
+        std::cout << "\r" << std::string(width + 1, ' ') << "\r" << line << "\n";
+        shown.clear();
+        draw();
+    }
+
+    void finish() {
+        shown.clear();
+        draw();
+        std::cout << "\n";
+    }
+};
+
+struct Tally {
+    size_t checked = 0, taken = 0, invalid = 0, errors = 0, rate_limits = 0, pings = 0;
+    std::vector<std::string> found;
+    double seconds = 0, rate_waited = 0;
+    bool stopped = false;
+    std::string webhook_error;
+};
+
+void print_summary(const Platform& p, size_t total, const Tally& t, bool webhook) {
+    const size_t width = ui_width(), key = 12, room = width - 6 - key;
+    auto count = [](size_t n, const std::string& what, const std::string& color) {
+        return paint(n ? color : DIM, std::to_string(n) + " " + what);
+    };
+    std::vector<std::string> lines = {
+        "",
+        "  " + count(t.found.size(), "available", std::string(GREEN) + BOLD) + "    " + count(t.taken, "taken", RED) +
+            "    " + count(t.invalid, "not allowed", YELLOW) + "    " +
+            count(t.errors, t.errors == 1 ? "error" : "errors", YELLOW),
+        "",
+    };
+    auto row = [&](const std::string& k, const std::string& v) { lines.push_back("  " + paint(DIM, pad(k, key)) + v); };
+
+    row("App", p.name);
+    row("Checked", std::to_string(t.checked) + " of " + std::to_string(total) + " names in " + duration_text(t.seconds));
+    if (t.rate_limits) {
+        row("Slowed by", std::to_string(t.rate_limits) + " rate limit" + (t.rate_limits == 1 ? "" : "s") + ", waited " +
+                             duration_text(t.rate_waited));
+    }
+    if (webhook) {
+        if (t.webhook_error.empty()) row("Webhook", std::to_string(t.pings) + " ping" + (t.pings == 1 ? "" : "s") + " sent");
+        else row("Webhook", paint(YELLOW, fit("stopped after an error: " + t.webhook_error, room)));
+    }
+
+    if (t.found.empty()) {
+        row("Found", paint(DIM, "nothing this time"));
+    } else {
+        // Names wrapped into up to 5 lines, the rest are in the results file anyway.
+        std::vector<std::string> rows(1);
+        size_t listed = 0;
+        for (const std::string& name : t.found) {
+            std::string n = fit(name, room);
+            if (!rows.back().empty() && rows.back().size() + 2 + n.size() > room) {
+                if (rows.size() == 5) break;
+                rows.emplace_back();
+            }
+            rows.back() += (rows.back().empty() ? "" : "  ") + n;
+            ++listed;
+        }
+        for (size_t i = 0; i < rows.size(); ++i) row(i ? "" : "Found", paint(std::string(GREEN) + BOLD, rows[i]));
+        if (listed < t.found.size()) row("", paint(DIM, "and " + std::to_string(t.found.size() - listed) + " more"));
+        row("Saved to", RESULTS_FILE);
+    }
+    lines.push_back("");
+    print_lines(box(t.stopped ? "Stopped early" : "Done", lines, width));
+}
+
+void run(const Platform& p, const Job& job, const Config& cfg) {
+    using namespace std::chrono;
+    screen({"ringer", p.name, job.label, "Checking"});
+    const size_t total = job.names.size();
     bool use_webhook = !cfg.webhook.empty();
-    if (use_webhook) std::cout << DIM << "Hits get sent to your Discord webhook." << RESET << "\n";
+    std::cout << " Checking " << paint(BOLD, std::to_string(total)) << " name" << (total == 1 ? "" : "s") << " on "
+              << p.name << ", " << format_seconds(job.delay) << "s apart. " << paint(DIM, "Ctrl+C stops early.") << "\n"
+              << " " << paint(DIM, std::string("Hits get saved to ") + RESULTS_FILE +
+                                       (use_webhook ? " and posted to your Discord webhook." : "."))
+              << "\n";
+    for (const std::string& w : job.warnings) std::cout << " " << paint(YELLOW, w) << "\n";
     std::cout << "\n";
 
-    std::vector<std::string> found;
-    int taken = 0, invalid = 0, errors = 0;
+    Tally t;
     g_stop = false;
     g_checking = true;
+    ProgressBar bar(total);
+    const std::string of_total = "/" + std::to_string(total);
+    const size_t digits = std::to_string(total).size();
+    bar.draw();
 
-    for (size_t i = 0; i < names.size() && !g_stop; ++i) {
-        const std::string& name = names[i];
-        std::string prefix = std::string(DIM) + "[" + std::to_string(i + 1) + "/" +
-                             std::to_string(names.size()) + "]" + RESET + " ";
+    for (size_t i = 0; i < total && !g_stop; ++i) {
+        const std::string& name = job.names[i];
         Result res = p.check(name);
         while (res.state == State::RateLimited && !g_stop) {
-            std::cout << prefix << YELLOW << "rate limited, waiting " << static_cast<int>(std::ceil(res.retry_after))
-                      << "s..." << RESET << std::endl;
-            nap(res.retry_after + 0.5);
+            ++t.rate_limits;
+            const auto began = steady_clock::now();
+            const auto until = began + duration_cast<steady_clock::duration>(duration<double>(res.retry_after + 0.5));
+            nap(res.retry_after + 0.5, [&] {
+                double left = duration<double>(until - steady_clock::now()).count();
+                bar.waiting = "rate limited: " + duration_text(std::ceil(std::max(0.0, left)));
+                bar.draw();
+            });
+            t.rate_waited += duration<double>(steady_clock::now() - began).count();
+            bar.waiting.clear();
             if (!g_stop) res = p.check(name);
         }
         if (g_stop) break;
 
+        ++t.checked;
+        if (res.state == State::Available) t.found.push_back(name);
+        bar.done = t.checked;
+        bar.found = t.found.size();
+
+        std::string counter = std::to_string(i + 1);
+        counter = std::string(digits - counter.size(), ' ') + counter + of_total;
+        auto report = [&](const std::string& color, const std::string& label, const std::string& detail) {
+            std::string line = " " + paint(DIM, counter) + "  " + paint(color, pad(label, 11)) + "  " + name;
+            const size_t used = 1 + counter.size() + 2 + 11 + 2 + name.size();
+            std::string d = plain_text(detail);
+            if (!d.empty() && used + 4 + 12 <= bar.width + 1) line += "  " + paint(DIM, "(" + fit(d, bar.width - used - 3) + ")");
+            bar.print(line);
+        };
+
         switch (res.state) {
             case State::Available: {
-                found.push_back(name);
                 save_hit(p.name, name);
-                std::cout << prefix << GREEN << BOLD << "AVAILABLE: " << name << RESET;
-                if (!res.detail.empty()) std::cout << " " << DIM << "(" << res.detail << ")" << RESET;
-                std::cout << "\a" << std::endl;
+                report(std::string(GREEN) + BOLD, "AVAILABLE", res.detail);
+                std::cout << "\a" << std::flush;
                 if (use_webhook) {
                     std::string err = webhook_send(cfg, "\xE2\x9C\x85 `" + name + "` is available on **" + p.name + "**");
-                    if (!err.empty()) {
-                        std::cout << prefix << YELLOW << "webhook failed (" << err
-                                  << "), turning it off for this run" << RESET << std::endl;
+                    if (err.empty()) {
+                        ++t.pings;
+                    } else {
+                        t.webhook_error = plain_text(err);
                         use_webhook = false;
+                        bar.print(" " + paint(YELLOW, fit("Webhook failed (" + t.webhook_error + "), skipping it for the rest of this run.",
+                                                          bar.width)));
                     }
                 }
                 break;
             }
             case State::Taken:
-                ++taken;
-                std::cout << prefix << RED << "taken" << RESET << "     " << name << std::endl;
+                ++t.taken;
+                report(RED, "taken", "");
                 break;
             case State::Invalid:
-                ++invalid;
-                std::cout << prefix << YELLOW << "not allowed" << RESET << " " << name << " " << DIM << "("
-                          << res.detail << ")" << RESET << std::endl;
+                ++t.invalid;
+                report(YELLOW, "not allowed", res.detail);
                 break;
             default:
-                ++errors;
-                std::cout << prefix << YELLOW << "error" << RESET << "     " << name << " " << DIM << "("
-                          << res.detail << ")" << RESET << std::endl;
+                ++t.errors;
+                report(YELLOW, "error", res.detail);
         }
-        if (i + 1 < names.size()) nap(delay);
+        bar.draw();
+        if (i + 1 < total) nap(job.delay, [&] { bar.draw(); });
     }
 
+    bar.finish();
+    t.seconds = bar.elapsed();
+    t.stopped = g_stop;
     g_checking = false;
-    if (g_stop) std::cout << "\n" << YELLOW << "Stopped." << RESET << "\n";
     g_stop = false;
 
-    std::cout << "\n" << BOLD << "Done." << RESET << " " << GREEN << found.size() << " available" << RESET << ", "
-              << taken << " taken, " << invalid << " not allowed, " << errors << " errors.\n";
-    if (!found.empty()) {
-        std::cout << GREEN << "Available: ";
-        for (size_t i = 0; i < found.size(); ++i) std::cout << (i ? ", " : "") << found[i];
-        std::cout << RESET << "\n" << DIM << "Saved to " << RESULTS_FILE << RESET << "\n";
+    std::cout << "\n";
+    print_summary(p, total, t, !cfg.webhook.empty());
+    std::cout << "\n";
+}
+
+// ---------------------------------------------------------------------------
+// The main screen
+// ---------------------------------------------------------------------------
+
+// Saturn in the style of https://scipython.com/media/old_blog/ascii-art/saturn-ascii-i.png,
+// shaded with the usual 70-step ramp of ASCII characters from dense ($@B%8&WM#) to
+// sparse (,"^`'.). SATURN_PAINT says which character is planet (o) and which is ring (=).
+const char* const SATURN[] = {
+    R"(                         ';>-}1)))}_l)",
+    R"(                    'i]\nvrjrftf\jzXXv-)",
+    R"(                 !}jnnzJLwh*****amj{cXX+)",
+    R"(             '<\YLQLOwZZqCzzCp*****Y{XX{)",
+    R"(           !(Uqahbh*#aqQUv]'  _h***01XX;)",
+    R"(        '-xUZdho#&%%WapmZOJ/:  w**o(cX-)",
+    R"(      `}vrzqoM&B@@8MakbbbwCn)^)**ajuz~)",
+    R"(     -vrzhwpoMWWM*oaoo*adOYntzo*qfcr;)",
+    R"(   ;rcfq*oX0wdkhao#MM*hq0UzJk*hzrv-)",
+    R"(  ~zuja**):Jmdka**ohbw0CJOk*bYrv}`)",
+    R"( -Xc(o**w  !uLOZmZOQLCZdo*Zcnx-')",
+    R"(;XX10***h_  '_fucYQwbo*mYxu(!)",
+    R"({XX{Y*****pCzzCqa**bLXxu|<')",
+    R"(+XXc{jma*****hwLJznnj}!)",
+    R"( -vXXzj\ftfrjrvn\]i')",
+    R"(   l_})))1}->;')",
+};
+const char* const SATURN_PAINT[] = {
+    "                         ============",
+    "                    ===================",
+    "                 =======================",
+    "             ===ooooooo=================",
+    "           ==ooooooooooooooo  ==========",
+    "        ====ooooooooooooooooo  ========",
+    "      =====ooooooooooooooooooo========",
+    "     ======oooooooooooooooooo========",
+    "   =======oooooooooooooooooo=======",
+    "  ========oooooooooooooooo========",
+    " ========  oooooooooooo=========",
+    "==========  ooooooo==========",
+    "===========================",
+    "=======================",
+    " ===================",
+    "   ============",
+};
+const size_t SATURN_WIDTH = 40;
+
+const char* const TITLE[] = {
+    R"(         _)",
+    R"(   _____(_)___  ____ ____  _____)",
+    R"(  / ___/ / __ \/ __ `/ _ \/ ___/)",
+    R"( / /  / / / / / /_/ /  __/ /)",
+    R"(/_/  /_/_/ /_/\__, /\___/_/)",
+    R"(             /____/)",
+};
+
+std::string saturn_line(size_t row) {
+    const std::string art = SATURN[row], paint_map = SATURN_PAINT[row];
+    std::string out;
+    char current = ' ';
+    for (size_t i = 0; i < art.size(); ++i) {
+        char part = i < paint_map.size() ? paint_map[i] : '=';
+        if (art[i] != ' ' && part != current) {
+            out += part == 'o' ? YELLOW : GOLD;
+            current = part;
+        }
+        out += art[i];
+    }
+    return out + RESET;
+}
+
+// Draws the main screen and returns the menu pick.
+int home_screen(const Config& cfg) {
+    screen({"ringer"});
+    const std::vector<Option> options = {
+        {"Discord", ""}, {"Roblox", ""}, {"Other apps", ""},
+        {"Webhook pings", cfg.webhook.empty() ? "off" : paint(GREEN, "on")},
+    };
+
+    std::vector<std::string> right;
+    for (const char* line : TITLE) right.push_back(paint(std::string(CYAN) + BOLD, line));
+    right.push_back(paint(DIM, "      find unclaimed usernames"));
+    right.push_back("");
+
+    const size_t width = ui_width(), gap = 3;
+    if (width >= SATURN_WIDTH + gap + 34) {
+        std::vector<std::string> m = menu_box("Pick an app", options, "Quit", width - SATURN_WIDTH - gap);
+        right.insert(right.end(), m.begin(), m.end());
+        const size_t rows = std::max(right.size(), sizeof SATURN / sizeof SATURN[0]);
+        for (size_t i = 0; i < rows; ++i) {
+            std::string left = i < sizeof SATURN / sizeof SATURN[0] ? saturn_line(i) : "";
+            std::cout << " " << pad(left, SATURN_WIDTH) << std::string(gap, ' ') << (i < right.size() ? right[i] : "")
+                      << "\n";
+        }
+    } else {
+        // Too narrow for Saturn, just the title and the menu.
+        std::vector<std::string> m = menu_box("Pick an app", options, "Quit", std::min<size_t>(width, 44));
+        right.insert(right.end(), m.begin(), m.end());
+        print_lines(right);
+    }
+    std::cout << "\n";
+    return read_choice(options.size(), true);
+}
+
+// The main menu. Returns false when they quit.
+bool pick_platform(Config& cfg, Platform& out) {
+    for (;;) {
+        switch (home_screen(cfg)) {
+            case 0: return false;
+            case 1: out = discord_platform(); return true;
+            case 2: out = roblox_platform(); return true;
+            case 3:
+                if (pick_other_app(out)) return true;
+                break;
+            default: webhook_settings(cfg);
+        }
     }
 }
 
@@ -990,12 +1556,15 @@ int main() {
     std::signal(SIGINT, on_sigint);
     Config cfg = load_config();
 
-    std::cout << BOLD << CYAN << "usercheck" << RESET << " " << DIM << "find unclaimed usernames" << RESET << "\n";
-    for (;;) {
-        Platform p = pick_platform(cfg);
-        std::vector<std::string> names = pick_names(p);
-        if (!names.empty()) run(p, names, cfg);
-        if (ask_choice("Again?", {"Yes", "No, quit"}) == 1) break;
+    Platform p;
+    while (pick_platform(cfg, p)) {
+        Job job;
+        while (pick_job(p, job)) {
+            run(p, job, cfg);
+            int next = menu("What next?", {{"Check more names on " + p.name, ""}, {"Main menu", ""}}, "Quit");
+            if (next == 0) return 0;
+            if (next == 2) break;
+        }
     }
     return 0;
 }
