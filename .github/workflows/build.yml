@@ -22,17 +22,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
-      - run: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -static usercheck.cpp -o usercheck.exe -lwinhttp
+      - run: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -static ringer.cpp -o ringer.exe -lwinhttp
       - uses: actions/upload-artifact@v4
         with:
-          name: usercheck-windows
-          path: usercheck.exe
+          name: ringer-windows
+          path: ringer.exe
+      # The release notes are this version's section of CHANGELOG.md ("## v1.2.3").
+      - if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        env:
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          awk -v heading="## $TAG" '$0 == heading {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "ringer (formerly usercheck). Download ringer.exe below and double-click it." > notes.md
       - if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
+          name: ringer ${{ inputs.release_tag || github.ref_name }}
+          body_path: notes.md
           target_commitish: ${{ github.sha }}
-          files: usercheck.exe
+          files: ringer.exe
 
   # Makes sure the CMake build works everywhere (MSVC on Windows).
   cmake:
