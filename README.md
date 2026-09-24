@@ -20,6 +20,8 @@ Or with CMake anywhere: `cmake -S . -B build && cmake --build build --config Rel
 
 Windows uses WinHTTP, which is built into Windows, so there's nothing extra to install. Linux and macOS use libcurl.
 
+**Making a new release:** Actions tab > build > Run workflow, type a tag like `v1.1.0`, and it publishes the .exe to Releases.
+
 ## Use it
 
 1. Pick an app: Discord, Roblox, or Other (Minecraft, GitHub, or a custom site URL)
