@@ -2073,6 +2073,267 @@ void run(const Platform& p, const Job& job, Config& cfg) {
 }
 
 // ---------------------------------------------------------------------------
+// Every app: a few names, each checked on all of them
+// ---------------------------------------------------------------------------
+
+std::vector<Platform> every_platform(const Config& cfg) {
+    return {discord_platform(), roblox_platform(), minecraft_platform(), github_platform(cfg.github_token),
+            lichess_platform(), chesscom_platform(), gitlab_platform()};
+}
+
+// Names typed with spaces or commas between them. An '@' in front is fine, and repeats (ignoring
+// case) only count once.
+std::vector<std::string> split_names(std::string text) {
+    std::replace(text.begin(), text.end(), ',', ' ');
+    std::istringstream words(text);
+    std::vector<std::string> names;
+    std::set<std::string> seen;
+    std::string word;
+    while (words >> word) {
+        while (!word.empty() && word.front() == '@') word.erase(0, 1);
+        if (!word.empty() && seen.insert(to_lower(word)).second) names.push_back(word);
+    }
+    return names;
+}
+
+// How a name did on each app.
+struct NameResult {
+    std::string name;
+    std::vector<std::string> free;  // apps it's free on, unconfirmed ones end in '?'
+    bool partial = false;           // Ctrl+C stopped it before every app was checked
+};
+
+void print_everywhere_summary(const std::vector<NameResult>& results, size_t apps, double seconds,
+                              const std::vector<std::string>& skipped, bool webhook, size_t pings,
+                              const std::string& webhook_error, bool stopped) {
+    const size_t width = ui_width();
+    size_t longest = 8;
+    for (const NameResult& r : results) longest = std::max(longest, r.name.size());
+    const size_t key = std::min<size_t>(longest, 16) + 2, room = width - 6 - key;
+    std::vector<std::string> lines = {""};
+    auto row = [&](const std::string& k, const std::string& v) {
+        lines.push_back("  " + paint(DIM, pad(fit(k, key - 2), key)) + v);
+    };
+
+    row("Checked", std::to_string(results.size()) + " name" + (results.size() == 1 ? "" : "s") + " on " +
+                       std::to_string(apps) + " apps in " + duration_text(seconds));
+    lines.push_back("");
+    bool unconfirmed = false, found = false;
+    for (const NameResult& r : results) {
+        std::string text;
+        std::string color = GREEN;
+        if (r.free.empty()) {
+            text = "free nowhere";
+            color = DIM;
+        } else if (r.free.size() == apps) {
+            text = "free everywhere";
+            color = std::string(GREEN) + BOLD;
+        } else {
+            text = "free on ";
+            for (size_t i = 0; i < r.free.size(); ++i) text += (i ? ", " : "") + r.free[i];
+        }
+        if (r.partial) text += " (stopped partway)";
+        for (const std::string& f : r.free) unconfirmed = unconfirmed || f.back() == '?';
+        found = found || !r.free.empty();
+        std::vector<std::string> wrapped = wrap(text, room);
+        for (size_t i = 0; i < wrapped.size(); ++i) {
+            lines.push_back("  " + std::string(i ? "" : BOLD) + pad(i ? "" : fit(r.name, key - 2), key) +
+                            (i ? "" : RESET) + paint(color, wrapped[i]));
+        }
+    }
+    lines.push_back("");
+    if (unconfirmed) row("", paint(DIM, "? = not double-checked"));
+    for (const std::string& note : skipped) row("Skipped", paint(YELLOW, fit(note, room)));
+    if (webhook) {
+        if (webhook_error.empty()) row("Webhook", std::to_string(pings) + " ping" + (pings == 1 ? "" : "s") + " sent");
+        else row("Webhook", paint(YELLOW, fit("stopped after an error: " + webhook_error, room)));
+    }
+    if (found) row("Saved to", RESULTS_FILE);
+    lines.push_back("");
+    print_lines(box(stopped ? "Stopped early" : "Done", lines, width));
+}
+
+// Checks each name on every app, showing each answer as it comes in. An app that makes ringer wait
+// a minute or less gets waited out. One that wants longer is skipped until then, so a long Discord
+// wait doesn't hold up the other six.
+void check_everywhere(const std::vector<std::string>& names, Config& cfg) {
+    using namespace std::chrono;
+    screen({"ringer", "Every app", "Checking"});
+    struct App {
+        Platform p;
+        steady_clock::time_point last{};  // when its last request finished
+        bool sent = false;
+        Lane resting{};                   // skipped until this runs out
+    };
+    std::vector<App> apps;
+    for (const Platform& p : every_platform(cfg)) apps.push_back({p});
+    bool use_webhook = !cfg.webhook.empty();
+    const size_t width = ui_width();
+    size_t column = 0;  // app names line up in a column this wide
+    for (const App& a : apps) column = std::max(column, a.p.name.size() + 2);
+    std::cout << " Checking " << paint(BOLD, std::to_string(names.size())) << " name" << (names.size() == 1 ? "" : "s")
+              << " on " << apps.size() << " apps. " << paint(DIM, "Ctrl+C stops early.") << "\n"
+              << " " << paint(DIM, std::string("Hits get saved to ") + RESULTS_FILE +
+                                       (use_webhook ? " and posted to your Discord webhook." : "."))
+              << "\n\n";
+
+    // Redraws the line for one app, like "   Roblox       checking...".
+    auto draw = [&](const std::string& app, const std::string& status) {
+        std::string line = "   " + pad(app, column) + status;
+        std::cout << "\r" << line << std::string(width > visible_len(line) ? width - visible_len(line) : 0, ' ')
+                  << std::flush;
+    };
+    auto answer = [&](const std::string& app, const std::string& color, const std::string& label,
+                      const std::string& detail) {
+        std::string line = paint(color, pad(label, 12));
+        const size_t used = 3 + column + 12;
+        std::string d = plain_text(detail);
+        if (!d.empty() && used + 4 + 12 <= width) line += "  " + paint(DIM, "(" + fit(d, width - used - 4) + ")");
+        draw(app, line);
+        std::cout << "\n";
+    };
+
+    g_stop = false;
+    g_checking = true;
+    const auto start = steady_clock::now();
+    std::vector<NameResult> results;
+    std::vector<std::string> skipped;
+    size_t pings = 0;
+    std::string webhook_error;
+
+    for (const std::string& name : names) {
+        if (g_stop) break;
+        std::cout << " " << paint(BOLD, fit(name, width - 1)) << "\n";
+        NameResult nr;
+        nr.name = name;
+        bool unconfirmed = false;
+        for (App& a : apps) {
+            if (g_stop) break;
+            const Platform& p = a.p;
+            // Discord names are lowercase only, so that's the one Discord gets asked about.
+            const std::string u = p.name == "Discord" ? to_lower(name) : name;
+            if (!p.valid(u)) {
+                answer(p.name, YELLOW, "not allowed", "breaks " + p.name + "'s username rules");
+                continue;
+            }
+            if (!a.resting.open()) {
+                answer(p.name, DIM, "skipped", "rate limited until " + clock_in(a.resting.left()));
+                continue;
+            }
+            draw(p.name, paint(DIM, "checking..."));
+            Result res;
+            for (int waits = 0;; ++waits) {
+                if (a.sent) nap(p.delay - duration<double>(steady_clock::now() - a.last).count());
+                res = p.check(u);
+                a.sent = true;
+                a.last = steady_clock::now();
+                if (res.state != State::RateLimited || g_stop) break;
+                const double wait = res.retry_after > 0 ? res.retry_after + 0.5 : 15;
+                if (wait > 60 || waits == 2) {
+                    const double rest = res.retry_after > 0 ? res.retry_after : 60;
+                    a.resting.rest(rest);
+                    if (rest >= 60) {
+                        cfg.limited_until[p.name] =
+                            static_cast<long long>(std::time(nullptr)) + static_cast<long long>(std::ceil(rest));
+                        save_config(cfg);
+                    }
+                    skipped.push_back(p.name + " from " + name + " on, rate limited until " + clock_in(rest));
+                    break;
+                }
+                const auto until = steady_clock::now() + duration_cast<steady_clock::duration>(duration<double>(wait));
+                nap(wait, [&] {
+                    const double left = duration<double>(until - steady_clock::now()).count();
+                    draw(p.name, paint(YELLOW, "rate limited, waiting " + duration_text(std::ceil(std::max(0.0, left)))));
+                });
+                if (g_stop) break;
+                draw(p.name, paint(DIM, "checking..."));
+            }
+            if (g_stop) {
+                draw("", "");
+                std::cout << "\r";
+                break;
+            }
+            switch (res.state) {
+                case State::Available:
+                    answer(p.name, std::string(GREEN) + BOLD, "AVAILABLE", res.detail);
+                    save_hit(p.name, u, res.unconfirmed);
+                    nr.free.push_back(res.unconfirmed ? p.name + "?" : p.name);
+                    unconfirmed = unconfirmed || res.unconfirmed;
+                    break;
+                case State::Taken: answer(p.name, RED, "taken", ""); break;
+                case State::Invalid: answer(p.name, YELLOW, "not allowed", res.detail); break;
+                case State::RateLimited:
+                    answer(p.name, YELLOW, "rate limited", "skipping it until " + clock_in(a.resting.left()));
+                    break;
+                default: answer(p.name, YELLOW, "error", res.detail);
+            }
+        }
+        nr.partial = g_stop;
+        if (!nr.free.empty()) {
+            std::cout << "\a" << std::flush;
+            if (use_webhook) {
+                std::string where;
+                for (size_t i = 0; i < nr.free.size(); ++i) {
+                    std::string app = nr.free[i];
+                    if (app.back() == '?') app.pop_back();
+                    where += std::string(i ? ", " : "") + "**" + app + "**";
+                }
+                std::string err = webhook_send(cfg, "\xE2\x9C\x85 `" + name + "` is available on " + where +
+                                                        (unconfirmed ? " (some not double-checked)" : ""));
+                if (err.empty()) {
+                    ++pings;
+                } else {
+                    webhook_error = plain_text(err);
+                    use_webhook = false;
+                    std::cout << " " << paint(YELLOW, fit("Webhook failed (" + webhook_error + "), skipping it from now on.", width))
+                              << "\n";
+                }
+            }
+        }
+        results.push_back(nr);
+        std::cout << "\n";
+    }
+
+    const bool stopped = g_stop;
+    g_checking = false;
+    g_stop = false;
+    print_everywhere_summary(results, apps.size(), duration<double>(steady_clock::now() - start).count(), skipped,
+                             !cfg.webhook.empty(), pings, webhook_error, stopped);
+    std::cout << "\n";
+}
+
+// The Every app screen. Returns false if they chose to quit.
+bool every_app(Config& cfg) {
+    for (;;) {
+        screen({"ringer", "Every app"});
+        text_box("How it works",
+                 "Type a name, or a few with spaces between them, and ringer checks each one on Discord, "
+                 "Roblox, Minecraft, GitHub, Lichess, Chess.com and GitLab. Keep it to a handful: Discord "
+                 "only allows about 20 checks before a long wait, and an app that wants ringer to wait "
+                 "more than a minute gets skipped for the rest of the run.");
+        std::string limited;
+        for (const Platform& p : every_platform(cfg)) {
+            const double left = limit_left(cfg, p.name);
+            if (left > 0) limited += (limited.empty() ? "" : ", ") + p.name + " until " + clock_in(left);
+        }
+        if (!limited.empty()) {
+            for (const std::string& line :
+                 wrap("Still rate limiting you: " + limited + ". Those will probably be skipped.", ui_width() - 2)) {
+                std::cout << " " << paint(YELLOW, line) << "\n";
+            }
+            std::cout << "\n";
+        }
+        const std::vector<std::string> names = split_names(read_line("Names (blank to go back): "));
+        if (names.empty()) return true;
+        std::cout << "\n";
+        check_everywhere(names, cfg);
+        int next = menu("What next?", {{"Check more names on every app", ""}, {"Main menu", ""}}, "Quit");
+        if (next == 0) return false;
+        if (next == 2) return true;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The main screen
 // ---------------------------------------------------------------------------
 
@@ -2148,6 +2409,7 @@ int home_screen(const Config& cfg) {
         {"Discord", limit_hint(cfg, "Discord")},
         {"Roblox", limit_hint(cfg, "Roblox")},
         {"Other apps", ""},
+        {"Every app", "all 7 at once"},
         {"Webhook pings", cfg.webhook.empty() ? "off" : paint(GREEN, "on")},
     };
 
@@ -2185,6 +2447,9 @@ bool pick_platform(Config& cfg, Platform& out) {
             case 2: out = roblox_platform(); return true;
             case 3:
                 if (pick_other_app(cfg, out)) return true;
+                break;
+            case 4:
+                if (!every_app(cfg)) return false;
                 break;
             default: webhook_settings(cfg);
         }
