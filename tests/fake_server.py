@@ -9,6 +9,7 @@ $SCENARIO is a comma separated list of the switches below that make a site misbe
 
     python3 tests/fake_server.py 8765
 """
+import base64
 import json
 import os
 import sys
@@ -35,6 +36,8 @@ DISCORD_TAKEN = {"discord", "torvalds", "takendc"}
 ROBLOX_TAKEN = {"roblox", "builderman", "takenrb"}
 ROBLOX_BAD = {"badword"}  # Roblox's filter turns these down
 MC_TAKEN = {"notch": "Notch", "jeb_": "jeb_"}
+MC_HELD = {"1kd", "_an"}  # nobody has them, but Minecraft is holding them
+MC_NOT_ALLOWED = {"badmc"}
 LICHESS_TAKEN = {"drnykterstein", "closedone"}  # closedone is a closed account
 GH_USERS = {"torvalds", "takengh"}
 GH_ORGS = {"anthropics"}
@@ -86,7 +89,7 @@ class Fake(BaseHTTPRequestHandler):
             "discord.com": self.discord,
             "users.roblox.com": self.roblox_batch,
             "auth.roblox.com": self.roblox_validate,
-            "api.minecraftservices.com": self.minecraft_bulk,
+            "api.minecraftservices.com": self.minecraft_services,
             "api.mojang.com": self.minecraft_one,
             "lichess.org": self.lichess,
             "api.github.com": self.github_api,
@@ -132,7 +135,27 @@ class Fake(BaseHTTPRequestHandler):
             return self.send(200, '{"code":2,"message":"Username not appropriate for Roblox"}')
         return self.send(200, '{"code":0,"message":"Username is valid"}')
 
-    def minecraft_bulk(self, path, q, body):
+    def minecraft_services(self, path, q, body):
+        if path.endswith("/bulk/byname"):
+            return self.minecraft_bulk(body)
+        # Everything else needs a logged in player's token: a JWT whose payload says who and until when.
+        try:
+            payload = self.headers.get("Authorization", "").split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=="))
+            good = claims.get("sub") == "doobert" and claims.get("exp", 0) > time.time()
+        except (IndexError, ValueError):
+            good = False
+        if not good:
+            return self.send(401, '{"path":"%s"}' % path)
+        if path == "/minecraft/profile":
+            return self.send(200, '{"id":"abc","name":"Doobert1","skins":[],"capes":[]}')
+        if "mc_available_429" in SCENARIO and bump("mc_available") == 1:
+            return self.send(429, "")
+        name = unquote(path.split("/")[4]).lower()
+        status = "DUPLICATE" if name in MC_TAKEN or name in MC_HELD else "NOT_ALLOWED" if name in MC_NOT_ALLOWED else "AVAILABLE"
+        return self.send(200, json.dumps({"status": status}))
+
+    def minecraft_bulk(self, body):
         names = json.loads(body)
         if len(names) > 10:
             return self.send(400, '{"error":"CONSTRAINT_VIOLATION"}')
