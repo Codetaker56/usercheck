@@ -27,10 +27,19 @@ jobs:
         with:
           name: ringer-windows
           path: ringer.exe
+      # The release notes are this version's section of CHANGELOG.md ("## v1.2.3").
+      - if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        env:
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          awk -v heading="## $TAG" '$0 == heading {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "ringer (formerly usercheck). Download ringer.exe below and double-click it." > notes.md
       - if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
+          name: ringer ${{ inputs.release_tag || github.ref_name }}
+          body_path: notes.md
           target_commitish: ${{ github.sha }}
           files: ringer.exe
 

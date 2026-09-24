@@ -13,9 +13,11 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <random>
 #include <set>
 #include <sstream>
@@ -47,6 +49,7 @@ const char* USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 const char* RESULTS_FILE = "available.txt";
+const char* UNCHECKED_FILE = "unchecked.txt";  // what a stopped .txt file run didn't get to
 const char* CONFIG_FILE = "ringer.cfg";
 const char* OLD_CONFIG_FILE = "usercheck.cfg";  // ringer used to be called usercheck
 
@@ -463,15 +466,16 @@ Response http(const std::string& method, const std::string& url, const std::stri
 #endif
 
 // How long a 429 says to wait: Discord puts it in the body, most sites in the header.
+// 0 means the server didn't say.
 double retry_after_seconds(const Response& r) {
     std::string value;
-    double seconds = 10.0;
+    double seconds = 0;
     try {
         if (json_get(r.body, "retry_after", value)) seconds = std::stod(value);
         else if (!r.retry_after.empty()) seconds = std::stod(r.retry_after);
     } catch (const std::exception&) {
     }
-    return std::max(seconds, 1.0);
+    return seconds > 0 ? std::max(seconds, 1.0) : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -483,7 +487,7 @@ enum class State { Available, Taken, Invalid, Error, RateLimited };
 struct Result {
     State state;
     std::string detail;
-    double retry_after = 0;
+    double retry_after = 0;  // for RateLimited: seconds the site asked for, 0 if it didn't say
 };
 
 struct Platform {
@@ -582,8 +586,10 @@ bool valid_github(const std::string& u) {
 
 Platform discord_platform() {
     return {"Discord", LOWER + DIGITS + "_.", valid_discord, check_discord, 1.5,
-            "Uses the same public check as Discord's sign-up page. "
-            "Discord rate limits this hard, ringer waits it out automatically."};
+            "Uses the same public check as Discord's sign-up page. Discord only lets each "
+            "internet connection check a handful of names (around 20) before making it wait, "
+            "sometimes for over half an hour, so big runs take hours. ringer waits it out and "
+            "carries on by itself."};
 }
 
 Platform roblox_platform() {
@@ -835,13 +841,29 @@ std::string duration_text(double seconds) {
     return buf;
 }
 
+// The local time `seconds` from now, like "14:05".
+std::string clock_in(double seconds) {
+    std::time_t t = std::time(nullptr) + static_cast<std::time_t>(std::ceil(seconds));
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof buf, "%H:%M", &local);
+    return buf;
+}
+
 // ---------------------------------------------------------------------------
-// Discord webhook
+// Settings (and the Discord webhook)
 // ---------------------------------------------------------------------------
 
 struct Config {
     std::string webhook;
     std::string mention;  // "", "@everyone", or a Discord user ID
+    // App name -> when its last long rate limit ends (unix time), so a restart knows about it.
+    std::map<std::string, long long> limited_until;
 };
 
 Config load_config() {
@@ -853,8 +875,16 @@ Config load_config() {
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
-        if (key == "webhook") cfg.webhook = value;
-        else if (key == "mention") cfg.mention = value;
+        if (key == "webhook") {
+            cfg.webhook = value;
+        } else if (key == "mention") {
+            cfg.mention = value;
+        } else if (starts_with(key, "limited_until.")) {
+            try {
+                cfg.limited_until[key.substr(14)] = std::stoll(value);
+            } catch (const std::exception&) {
+            }
+        }
     }
     return cfg;
 }
@@ -862,8 +892,25 @@ Config load_config() {
 bool save_config(const Config& cfg) {
     std::ofstream f(CONFIG_FILE);
     f << "webhook=" << cfg.webhook << "\n" << "mention=" << cfg.mention << "\n";
+    const long long now = std::time(nullptr);
+    for (const auto& app : cfg.limited_until) {
+        if (app.second > now) f << "limited_until." << app.first << "=" << app.second << "\n";
+    }
     f.close();
     return !f.fail();
+}
+
+// Seconds left on the last long rate limit `app` gave us, 0 if there isn't one.
+double limit_left(const Config& cfg, const std::string& app) {
+    auto it = cfg.limited_until.find(app);
+    if (it == cfg.limited_until.end()) return 0;
+    return static_cast<double>(std::max<long long>(0, it->second - static_cast<long long>(std::time(nullptr))));
+}
+
+// Menu hint for an app that's still rate limiting us, like "limited 31m 05s".
+std::string limit_hint(const Config& cfg, const std::string& app, const std::string& otherwise = "") {
+    double left = limit_left(cfg, app);
+    return left > 0 ? paint(YELLOW, "limited " + duration_text(left)) : otherwise;
 }
 
 bool looks_like_webhook(const std::string& url) {
@@ -896,7 +943,8 @@ std::string webhook_send(const Config& cfg, const std::string& text) {
         Response r = http("POST", cfg.webhook, body);
         if (r.status >= 200 && r.status < 300) return "";
         if (r.status == 429) {
-            nap(retry_after_seconds(r));
+            double wait = retry_after_seconds(r);
+            nap(wait > 0 ? wait : 5);
             continue;
         }
         if (r.status == 0) return r.error;
@@ -1040,11 +1088,12 @@ bool custom_platform(Platform& out) {
 }
 
 // Returns false if they backed out to the main menu.
-bool pick_other_app(Platform& out) {
+bool pick_other_app(const Config& cfg, Platform& out) {
     for (;;) {
         screen({"ringer", "Other apps"});
         int pick = menu("Which app?",
-                        {{"Minecraft (Java)", "Mojang lookup"}, {"GitHub", "profile page"},
+                        {{"Minecraft (Java)", limit_hint(cfg, "Minecraft (Java)", "Mojang lookup")},
+                         {"GitHub", limit_hint(cfg, "GitHub", "profile page")},
                          {"Custom site", "any profile URL"}},
                         "Back");
         if (pick == 0) return false;
@@ -1115,10 +1164,11 @@ struct Job {
     std::vector<std::string> names;
     std::vector<std::string> warnings;  // shown when the run starts
     double delay = 1.0;
+    bool from_file = false;             // stopped runs save what's left so it can be picked up later
 };
 
 // Asks what to check and how fast. Returns false if they backed out to the main menu.
-bool pick_job(const Platform& p, Job& job) {
+bool pick_job(const Platform& p, const Config& cfg, Job& job) {
     enum Kind { File, Letters, Chars, Custom };
     struct Mode {
         const char* label;
@@ -1149,6 +1199,13 @@ bool pick_job(const Platform& p, Job& job) {
 
         screen({"ringer", p.name, job.label});
         text_box("Heads up", p.note);
+        const double left = limit_left(cfg, p.name);
+        if (left > 0) {
+            std::cout << " " << paint(YELLOW, fit(p.name + " was rate limiting you until " + clock_in(left) + ", " +
+                                                      duration_text(left) + " from now.", ui_width()))
+                      << "\n " << paint(DIM, "On the same connection the run will likely have to wait for that.")
+                      << "\n\n";
+        }
 
         if (mode.kind == File) {
             std::cout << " " << paint(DIM, "One name per line. Drag the file into this window or type its path.") << "\n";
@@ -1168,6 +1225,7 @@ bool pick_job(const Platform& p, Job& job) {
                 flash(RED, "That file has no names " + p.name + " would allow.");
                 continue;
             }
+            job.from_file = true;
             if (skipped) {
                 job.warnings.push_back("Skipped " + std::to_string(skipped) + " name(s) that break " + p.name +
                                        "'s username rules.");
@@ -1283,6 +1341,7 @@ struct Tally {
     double seconds = 0, rate_waited = 0;
     bool stopped = false;
     std::string webhook_error;
+    size_t unchecked_saved = 0;  // names written to UNCHECKED_FILE
 };
 
 void print_summary(const Platform& p, size_t total, const Tally& t, bool webhook) {
@@ -1329,11 +1388,16 @@ void print_summary(const Platform& p, size_t total, const Tally& t, bool webhook
         if (listed < t.found.size()) row("", paint(DIM, "and " + std::to_string(t.found.size() - listed) + " more"));
         row("Saved to", RESULTS_FILE);
     }
+    if (t.unchecked_saved) {
+        row("Left over", std::to_string(t.unchecked_saved) + " name" + (t.unchecked_saved == 1 ? "" : "s") +
+                             " saved to " + UNCHECKED_FILE);
+        row("", paint(DIM, fit(std::string("load ") + UNCHECKED_FILE + " next time to carry on", room)));
+    }
     lines.push_back("");
     print_lines(box(t.stopped ? "Stopped early" : "Done", lines, width));
 }
 
-void run(const Platform& p, const Job& job, const Config& cfg) {
+void run(const Platform& p, const Job& job, Config& cfg) {
     using namespace std::chrono;
     screen({"ringer", p.name, job.label, "Checking"});
     const size_t total = job.names.size();
@@ -1354,23 +1418,45 @@ void run(const Platform& p, const Job& job, const Config& cfg) {
     const size_t digits = std::to_string(total).size();
     bar.draw();
 
+    // Waits out a rate limit with a countdown on the bar. Long ones get a heads-up with the time it
+    // carries on, and get saved to ringer.cfg so the menus can warn about them after a restart.
+    auto wait_out = [&](double seconds) {
+        ++t.rate_limits;
+        if (seconds >= 60) {
+            cfg.limited_until[p.name] = static_cast<long long>(std::time(nullptr)) + static_cast<long long>(std::ceil(seconds));
+            save_config(cfg);
+            bar.print(" " + paint(YELLOW, fit(p.name + " rate limited you for " + duration_text(seconds) +
+                                                  ". Carrying on by itself at " + clock_in(seconds) + ".",
+                                              bar.width)));
+            bar.print(" " + paint(DIM, fit("Leave this window open, or Ctrl+C to stop and see what it found so far.", bar.width)));
+        }
+        const auto began = steady_clock::now();
+        const auto until = began + duration_cast<steady_clock::duration>(duration<double>(seconds));
+        nap(seconds, [&] {
+            double left = duration<double>(until - steady_clock::now()).count();
+            bar.waiting = "rate limited: " + duration_text(std::ceil(std::max(0.0, left)));
+            bar.draw();
+        });
+        t.rate_waited += duration<double>(steady_clock::now() - began).count();
+        bar.waiting.clear();
+    };
+    // For sites that rate limit without saying how long: 15s, then 30s, 1m... up to 10m.
+    double backoff = 15;
+
     for (size_t i = 0; i < total && !g_stop; ++i) {
         const std::string& name = job.names[i];
         Result res = p.check(name);
         while (res.state == State::RateLimited && !g_stop) {
-            ++t.rate_limits;
-            const auto began = steady_clock::now();
-            const auto until = began + duration_cast<steady_clock::duration>(duration<double>(res.retry_after + 0.5));
-            nap(res.retry_after + 0.5, [&] {
-                double left = duration<double>(until - steady_clock::now()).count();
-                bar.waiting = "rate limited: " + duration_text(std::ceil(std::max(0.0, left)));
-                bar.draw();
-            });
-            t.rate_waited += duration<double>(steady_clock::now() - began).count();
-            bar.waiting.clear();
+            if (res.retry_after > 0) {
+                wait_out(res.retry_after + 0.5);
+            } else {
+                wait_out(backoff);
+                backoff = std::min(backoff * 2, 600.0);
+            }
             if (!g_stop) res = p.check(name);
         }
         if (g_stop) break;
+        backoff = 15;
 
         ++t.checked;
         if (res.state == State::Available) t.found.push_back(name);
@@ -1426,6 +1512,14 @@ void run(const Platform& p, const Job& job, const Config& cfg) {
     t.stopped = g_stop;
     g_checking = false;
     g_stop = false;
+
+    // Names are checked in order, so everything from t.checked on is still to do.
+    if (t.stopped && job.from_file && t.checked < total) {
+        std::ofstream f(UNCHECKED_FILE);
+        for (size_t i = t.checked; i < total; ++i) f << job.names[i] << "\n";
+        f.close();
+        if (!f.fail()) t.unchecked_saved = total - t.checked;
+    }
 
     std::cout << "\n";
     print_summary(p, total, t, !cfg.webhook.empty());
@@ -1505,7 +1599,9 @@ std::string saturn_line(size_t row) {
 int home_screen(const Config& cfg) {
     screen({"ringer"});
     const std::vector<Option> options = {
-        {"Discord", ""}, {"Roblox", ""}, {"Other apps", ""},
+        {"Discord", limit_hint(cfg, "Discord")},
+        {"Roblox", limit_hint(cfg, "Roblox")},
+        {"Other apps", ""},
         {"Webhook pings", cfg.webhook.empty() ? "off" : paint(GREEN, "on")},
     };
 
@@ -1542,7 +1638,7 @@ bool pick_platform(Config& cfg, Platform& out) {
             case 1: out = discord_platform(); return true;
             case 2: out = roblox_platform(); return true;
             case 3:
-                if (pick_other_app(out)) return true;
+                if (pick_other_app(cfg, out)) return true;
                 break;
             default: webhook_settings(cfg);
         }
@@ -1559,7 +1655,7 @@ int main() {
     Platform p;
     while (pick_platform(cfg, p)) {
         Job job;
-        while (pick_job(p, job)) {
+        while (pick_job(p, cfg, job)) {
             run(p, job, cfg);
             int next = menu("What next?", {{"Check more names on " + p.name, ""}, {"Main menu", ""}}, "Quit");
             if (next == 0) return 0;
