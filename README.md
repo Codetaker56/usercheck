@@ -123,11 +123,13 @@ So without a token, Minecraft hits are marked **not double-checked**. With one, 
 3. Click a request to `api.minecraftservices.com` and copy what comes after `Bearer ` in its Authorization header (pasting it with `Bearer ` in front is fine too)
 4. In ringer: Other apps > Minecraft token > Set token. It checks the token and tells you whose it is
 
+Minecraft only allows a handful of these logged in checks before it wants a break, so with a token ringer paces them to its limit (see [Rate limits](#rate-limits)). Big runs of names that are mostly free take a while. The public lookup part stays fast.
+
 The token works for about a day, then ringer goes back to marking hits not double-checked until you set a new one. **Until it runs out, anyone who has it can change your Minecraft name and skin**, so don't share it or your `ringer.cfg`.
 
 ## Rate limits
 
-Every site limits how fast you can check names. When one tells ringer to back off, ringer waits exactly as long as the site asks and then keeps going by itself. The progress bar counts down the wait. If a site doesn't say how long, ringer waits 15 seconds, then 30, then a minute, and so on up to 10 minutes.
+Every site limits how fast you can check names. When one tells ringer to back off, ringer waits exactly as long as the site asks and then keeps going by itself. The progress bar counts down the wait. If a site doesn't say how long, ringer slows itself down for that site instead: it waits a moment, spaces its checks further apart each time it gets told off, and eases back up as checks go through. It settles just under the site's real limit, and the summary says where (like `Paced  one check every 8.5s, to stay under Minecraft (Java)'s limit`). Batch lookups that get told off without a time wait 15 seconds, then 30, then a minute, up to 10 minutes.
 
 **Discord is the harsh one.** Its sign-up check only lets each internet connection check about 20 names before it makes you wait, and that wait can be over half an hour (one run got told to wait 2117 seconds). No setting in ringer changes that, it's Discord's limit. Lowering "seconds between checks" just gets you to the wait faster.
 

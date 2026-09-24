@@ -259,6 +259,19 @@ def minecraft_token_double_checks_what_the_lookup_misses():
 
 
 @test
+def checks_pace_themselves_under_a_limit_that_does_not_say_how_long():
+    # The fake allows 5 checks at once, then 2 a second, and its 429s don't say how long to wait.
+    # Waiting 15s after every 429 took over a minute here and ran into the limit 5 times.
+    names = "".join(f"free{i}\n" for i in range(30))
+    start = time.time()
+    r = Run(from_file(MINECRAFT, "names.txt"), scenario="mc_available_bucket", cfg=f"minecraft_token={MC_TOKEN}\n",
+            files={"names.txt": names}, timeout=45)
+    r.expect_summary("30 available", "Paced one check every")
+    retries = len(r.to("api.minecraftservices.com", "/available")) - 30
+    assert retries <= 3 and time.time() - start < 35, (retries, time.time() - start)
+
+
+@test
 def minecraft_token_is_checked_before_it_is_saved():
     bad = minecraft_token(86400, who="someone else")
     r = Run(f"3\n8\n1\nnot a token!\nBearer {bad}\n1\nBearer {MC_TOKEN}\n0\n0\n0\n")
@@ -392,8 +405,10 @@ def chesscom_double_checks_hits_until_cloudflare_says_stop():
 def gitlab_reserved_names_and_429s():
     r = Run(from_file(GITLAB, "names.txt"), scenario="gitlab_429",
             files={"names.txt": "sytses\ngitlab-org\napi\nfreegl\nexplore\n-abc\n"})
-    r.expect("reserved by GitLab", "rate limited: 15s", "Skipped 1 name(s)")
-    r.expect_summary("1 available", "2 taken", "2 not allowed", "Slowed by 1 rate limit")
+    r.expect("reserved by GitLab", "Skipped 1 name(s)")
+    # Its 429s don't say how long, so ringer waits a little and paces itself instead of sitting out 15s.
+    r.expect_summary("1 available", "2 taken", "2 not allowed", "Slowed by 1 rate limit, waited 1s",
+                     "Paced one check every")
     assert not r.to("gitlab.com", "sign_in"), "redirects aren't followed"
 
 
