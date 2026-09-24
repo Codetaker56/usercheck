@@ -2008,6 +2008,7 @@ struct Tally {
     bool stopped = false;
     std::string webhook_error;
     size_t unchecked_saved = 0;  // names written to UNCHECKED_FILE
+    double check_gap = 0;        // where one-name checks' spacing settled, see run()
 };
 
 void print_summary(const Platform& p, size_t total, const Tally& t, bool webhook) {
@@ -2026,6 +2027,10 @@ void print_summary(const Platform& p, size_t total, const Tally& t, bool webhook
 
     row("App", p.name);
     row("Checked", std::to_string(t.checked) + " of " + std::to_string(total) + " names in " + duration_text(t.seconds));
+    if (t.check_gap > 0) {
+        row("Paced", "one check every " + format_seconds(std::round(t.check_gap * 10) / 10) + "s, to stay under " +
+                         p.name + "'s limit");
+    }
     if (t.rate_limits) {
         row("Slowed by", std::to_string(t.rate_limits) + " rate limit" + (t.rate_limits == 1 ? "" : "s") + ", waited " +
                              duration_text(t.rate_waited));
@@ -2127,16 +2132,23 @@ void run(const Platform& p, const Job& job, Config& cfg) {
         }
     };
 
-    // Keeps requests job.delay apart, and lookups p.lookup_gap apart too, counting from when the
-    // last one finished. Names a batch lookup already answered don't need a request, so they don't
-    // wait. The time left gets worked out once the wait is over.
+    // One-name checks on sites that rate limit without saying for how long (Minecraft's logged in
+    // check, Roblox's validation, GitLab, Chess.com) get spacing that adapts. Each 429 stretches it
+    // by half, starting at twice the run's delay (1s at least) and going up to a minute, and waits
+    // that long before trying again. Each check that goes through shrinks it by 3%. So it settles
+    // just under the site's real limit, instead of running into it and waiting 15s, 30s, 1m...
+    double check_gap = 0;
+
+    // Keeps requests job.delay apart, checks check_gap apart and lookups p.lookup_gap apart too,
+    // counting from when the last one finished. Names a batch lookup already answered don't need a
+    // request, so they don't wait. The time left gets worked out once the wait is over.
     steady_clock::time_point last_request, last_lookup, asked;
     bool sent = false, looked = false;
     auto wait_since = [&](steady_clock::time_point since, double seconds) {
         nap(seconds - duration<double>(steady_clock::now() - since).count(), [&] { bar.draw(); });
     };
     auto pace = [&](bool lookup) {
-        if (sent) wait_since(last_request, job.delay);
+        if (sent) wait_since(last_request, lookup ? job.delay : std::max(job.delay, check_gap));
         if (lookup && looked) wait_since(last_lookup, p.lookup_gap);
         bar.update_eta();
         asked = steady_clock::now();
@@ -2194,9 +2206,15 @@ void run(const Platform& p, const Job& job, Config& cfg) {
                 res = p.check(name);
                 sent_now(false, res.state != State::RateLimited);
                 if (res.state != State::RateLimited || g_stop) break;
-                wait_for(res);
+                if (res.retry_after > 0) {
+                    wait_for(res);
+                } else {
+                    check_gap = std::min(60.0, check_gap > 0 ? check_gap * 1.5 : std::max(1.0, 2 * job.delay));
+                    wait_out(check_gap);
+                }
                 if (g_stop) break;
             }
+            if (res.state != State::RateLimited) check_gap *= 0.97;
         }
         if (g_stop) break;
         backoff = 15;
@@ -2255,6 +2273,7 @@ void run(const Platform& p, const Job& job, Config& cfg) {
 
     bar.finish();
     t.seconds = bar.elapsed();
+    t.check_gap = check_gap > job.delay ? check_gap : 0;
     t.stopped = g_stop;
     g_checking = false;
     g_stop = false;

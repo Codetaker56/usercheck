@@ -2,6 +2,11 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.5.1
+
+- **Far fewer rate limit stops** on sites that say "too many requests" without saying for how long: Minecraft's logged in check, Roblox's validation, GitLab and Chess.com. ringer used to keep going until it got told off, then wait 15 seconds, 30, a minute and so on. Now it waits a moment, spaces its checks further apart, and eases back up as they go through, so it settles just under the site's real limit. The summary says where it settled. In testing against a limit like that, 30 names took 18 seconds with one stop instead of over a minute with five.
+- Minecraft's limit itself can't be raised. It's set per account and connection, and getting around it means more accounts or proxies, which ringer doesn't do.
+
 ## v2.5.0
 
 - **Fixed: Minecraft said held names were available.** Minecraft holds names that no player has right now (changed away from in the last 37 days, banned, or never moved to Microsoft), and Mojang's public lookup can't see that. `1kd` got pinged as available when minecraft.net said it was taken. Without a token, Minecraft hits are now marked "not double-checked".

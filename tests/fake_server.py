@@ -30,6 +30,18 @@ type Query { repositoryOwner(login: String!): RepositoryOwner }
 SCENARIO = set(os.environ.get("SCENARIO", "").split(","))
 LOG = open(os.environ.get("FAKE_LOG", "fake.log"), "a")
 counts = {}
+# For mc_available_bucket: Minecraft's logged in check allowing 5 at once, then 2 a second.
+bucket = {"tokens": 5.0, "at": time.time()}
+
+
+def take_token():
+    now = time.time()
+    bucket["tokens"] = min(5.0, bucket["tokens"] + (now - bucket["at"]) * 2)
+    bucket["at"] = now
+    if bucket["tokens"] < 1:
+        return False
+    bucket["tokens"] -= 1
+    return True
 
 # Who has which name on each fake site, all lowercase.
 DISCORD_TAKEN = {"discord", "torvalds", "takendc"}
@@ -150,6 +162,8 @@ class Fake(BaseHTTPRequestHandler):
         if path == "/minecraft/profile":
             return self.send(200, '{"id":"abc","name":"Doobert1","skins":[],"capes":[]}')
         if "mc_available_429" in SCENARIO and bump("mc_available") == 1:
+            return self.send(429, "")
+        if "mc_available_bucket" in SCENARIO and not take_token():
             return self.send(429, "")
         name = unquote(path.split("/")[4]).lower()
         status = "DUPLICATE" if name in MC_TAKEN or name in MC_HELD else "NOT_ALLOWED" if name in MC_NOT_ALLOWED else "AVAILABLE"
