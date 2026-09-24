@@ -2,6 +2,12 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.5.0
+
+- **Fixed: Minecraft said held names were available.** Minecraft holds names that no player has right now (changed away from in the last 37 days, banned, or never moved to Microsoft), and Mojang's public lookup can't see that. `1kd` got pinged as available when minecraft.net said it was taken. Without a token, Minecraft hits are now marked "not double-checked".
+- **New: Minecraft token** (Other apps > Minecraft token). With it, names the public lookup doesn't find get double-checked with the same check minecraft.net's name change page uses, so held names count as taken. The README says how to get one. It lasts about a day, and ringer notices when it has run out.
+- Every app only says "free everywhere" when every one of those answers was double-checked.
+
 ## v2.4.1
 
 - Fixed: moving to a new screen now really clears the window. In Windows Terminal and newer Windows consoles, every old screen used to pile up in the scroll history above the new one.

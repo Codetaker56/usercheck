@@ -12,6 +12,7 @@ Each test types into ringer's menus exactly like a person would, in a fresh fold
 at the screen, the files ringer wrote, and the requests the fake server got. A few wait out real
 rate limit timers (Lichess asks for a whole minute), so the full run takes about 3 minutes.
 """
+import base64
 import json
 import os
 import re
@@ -29,6 +30,15 @@ BINARY = os.path.join(ROOT, "build", "ringer-test")
 FAKE = os.path.join(ROOT, "tests", "fake_server.py")
 PORT = 8765
 TOKEN = "ghp_good123"
+
+
+def minecraft_token(seconds_left, who="doobert"):
+    """A JWT like minecraft.net's, which the fake accepts for `who` until it runs out."""
+    part = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return part({"alg": "HS256"}) + "." + part({"sub": who, "exp": int(time.time() + seconds_left)}) + ".sig"
+
+
+MC_TOKEN = minecraft_token(86400)
 WEBHOOK = "https://discord.com/api/webhooks/1/abc"
 
 # Main menu: 1 Discord, 2 Roblox, 3 Other apps, 4 Every app, 5 Webhook pings.
@@ -226,6 +236,46 @@ def time_left_counts_down_by_requests():
     assert all(b <= a for a, b in zip(shown, shown[1:])), f"went back up: {shown}"
 
 
+@test
+def minecraft_hits_are_unsure_without_a_token():
+    # The public lookup can't see names Minecraft is holding, like 1kd.
+    r = Run(from_file(MINECRAFT, "names.txt"), files={"names.txt": "Notch\n1kd\nfreemc\n"})
+    r.expect("not double-checked, Minecraft may be holding it")
+    r.expect_summary("2 available", "1 taken", "? = not double-checked, 2 of them")
+    assert r.file("available.txt") == ("Minecraft (Java): 1kd (not double-checked)\n"
+                                       "Minecraft (Java): freemc (not double-checked)\n")
+    assert not r.to("api.minecraftservices.com", "/available")
+
+
+@test
+def minecraft_token_double_checks_what_the_lookup_misses():
+    r = Run(from_file(MINECRAFT, "names.txt"), cfg=f"minecraft_token={MC_TOKEN}\n",
+            files={"names.txt": "Notch\nNOTCH\n1kd\n_an\nbadmc\nfreemc\n"})
+    r.expect_summary("1 available", "4 taken", "1 not allowed")
+    assert "not double-checked" not in r.screen
+    checked = [q["path"].split("/")[4] for q in r.to("api.minecraftservices.com", "/available")]
+    assert checked == ["1kd", "_an", "badmc", "freemc"], checked
+    assert r.file("available.txt") == "Minecraft (Java): freemc\n"
+
+
+@test
+def minecraft_token_is_checked_before_it_is_saved():
+    bad = minecraft_token(86400, who="someone else")
+    r = Run(f"3\n8\n1\nnot a token!\nBearer {bad}\n1\nBearer {MC_TOKEN}\n0\n0\n0\n")
+    r.expect("That doesn't look like a Minecraft token.", "Didn't work: Minecraft says that token is wrong or has run out",
+             "Token saved for Doobert1. Minecraft checks use the logged in check now.")
+    assert f"minecraft_token={MC_TOKEN}\n" in r.file("ringer.cfg"), "saved without the Bearer"
+
+
+@test
+def minecraft_token_that_ran_out_is_ignored():
+    expired = minecraft_token(-10)
+    r = Run(f"3\n1\n1\nnames.txt\n0\n0\n", cfg=f"minecraft_token={expired}\n", files={"names.txt": "1kd\n"})
+    assert re.search(r"Minecraft token\s+ran out", r.screen) and re.search(r"Minecraft \(Java\)\s+public lookup", r.screen)
+    r.expect_summary("? = not double-checked")
+    assert not r.to("api.minecraftservices.com", "/available")
+
+
 # --- Lichess ----------------------------------------------------------------------------------
 
 @test
@@ -364,11 +414,19 @@ def turning_off_the_webhook_keeps_the_rest_of_the_settings():
 def every_app_checks_each_name_everywhere():
     r = Run("4\nfreeall torvalds a.b @freeall\n0\n", cfg=f"webhook={WEBHOOK}\nmention=\n")
     r.expect("Checking 3 names on 7 apps.", "breaks Roblox's username rules")
-    r.expect_summary("freeall free everywhere", "torvalds free on Roblox, Minecraft (Java), Lichess, Chess.com, GitLab",
+    r.expect_summary("freeall free on Discord, Roblox, Minecraft (Java)?, GitHub, Lichess,", "| | Chess.com, GitLab |",
+                     "torvalds free on Roblox, Minecraft (Java)?, Lichess, Chess.com, GitLab",
                      "a.b free on Discord, GitLab", "3 pings sent")
     pings = [json.loads(q["body"])["content"] for q in r.to("discord.com", "/api/webhooks/")]
     assert pings[2] == "✅ `a.b` is available on **Discord**, **GitLab**", pings
     assert len(r.file("available.txt").splitlines()) == 14
+
+
+@test
+def every_app_uses_the_minecraft_token():
+    r = Run("4\n1kd\n0\n", cfg=f"minecraft_token={MC_TOKEN}\n")
+    assert "Minecraft" not in r.summary().split("free on")[-1], r.summary()
+    assert len(r.to("api.minecraftservices.com", "/available")) == 1
 
 
 @test

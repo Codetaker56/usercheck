@@ -586,6 +586,9 @@ struct Platform {
     size_t batch = 0;        // most names per lookup
     bool confirm = false;
     double lookup_gap = 0;   // least seconds between lookups, for sites that allow fewer of those
+    // When set, a name the lookup can't find is only probably free: it counts as available but not
+    // double-checked, with this as the reason.
+    std::string unsure = "";
 };
 
 // Handles the answers every check treats the same: no response, and rate limits.
@@ -729,8 +732,82 @@ bool valid_roblox(const std::string& u) {
            std::count(u.begin(), u.end(), '_') <= 1 && u.front() != '_' && u.back() != '_';
 }
 
+Options bearer(const std::string& token) {
+    Options opt;
+    opt.headers = {"Authorization: Bearer " + token};
+    return opt;
+}
+
+// Decodes base64url, the encoding of a JWT token's middle part. Returns "" if it isn't that.
+std::string base64url_decode(const std::string& s) {
+    static const std::string digits = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    unsigned bits = 0, count = 0;
+    for (char c : s) {
+        if (c == '=') break;
+        const size_t v = digits.find(c);
+        if (v == std::string::npos) return "";
+        bits = ((bits << 6) | static_cast<unsigned>(v)) & 0xFFFFFF;
+        count += 6;
+        if (count >= 8) {
+            count -= 8;
+            out += static_cast<char>((bits >> count) & 0xFF);
+        }
+    }
+    return out;
+}
+
+// Seconds until a token stops working, going by the "exp" in it if it's a JWT (Minecraft's are).
+// Negative once it has, and huge when the token doesn't say (GitHub's don't).
+double token_seconds_left(const std::string& token) {
+    const size_t a = token.find('.'), b = token.find('.', a + 1);
+    std::string exp;
+    if (a == std::string::npos || b == std::string::npos ||
+        !json_get(base64url_decode(token.substr(a + 1, b - a - 1)), "exp", exp)) {
+        return 1e12;
+    }
+    try {
+        return std::stod(exp) - static_cast<double>(std::time(nullptr));
+    } catch (const std::exception&) {
+        return 1e12;
+    }
+}
+
+// Whether a saved token is there and hasn't run out.
+bool token_works(const std::string& token) {
+    return !token.empty() && token_seconds_left(token) > 60;
+}
+
+// Mojang's public profile lookup. It can't see names Minecraft is holding, see minecraft_platform.
 Result check_minecraft(const std::string& u) {
     return check_profile_url("https://api.mojang.com/users/profiles/minecraft/" + url_encode(u));
+}
+
+// The check minecraft.net's name change page uses, so it needs a logged in Minecraft account's
+// token. It's the only one that knows about names Minecraft is holding.
+Result check_minecraft_signed_in(const std::string& u, const std::string& token) {
+    Response r = http("GET", "https://api.minecraftservices.com/minecraft/profile/name/" + url_encode(u) + "/available",
+                      "", bearer(token));
+    Result out;
+    if (common_result(r, out)) return out;
+    if (r.status == 401) return {State::Error, "Minecraft token ran out or is wrong, paste a new one in Other apps"};
+    std::string status;
+    if (r.status == 200 && json_get(r.body, "status", status)) {
+        if (status == "AVAILABLE") return {State::Available, ""};
+        if (status == "DUPLICATE") return {State::Taken, ""};
+        if (status == "NOT_ALLOWED") return {State::Invalid, "Minecraft doesn't allow it"};
+    }
+    return {State::Error, http_error(r)};
+}
+
+// Asks Minecraft whose `token` is. Returns "" and puts the player's name in `who` if it works.
+std::string minecraft_token_problem(const std::string& token, std::string& who) {
+    Response r = http("GET", "https://api.minecraftservices.com/minecraft/profile", "", bearer(token));
+    if (r.status == 200 && json_get(r.body, "name", who)) return "";
+    if (r.status == 0) return r.error;
+    if (r.status == 401) return "Minecraft says that token is wrong or has run out";
+    if (r.status == 404) return "that account doesn't have Minecraft Java";
+    return http_error(r);
 }
 
 // Mojang's bulk profile lookup takes 10 names per request and answers with the ones that exist.
@@ -752,12 +829,6 @@ bool valid_minecraft(const std::string& u) {
 
 Result check_github(const std::string& u) {
     return check_profile_url("https://github.com/" + url_encode(u));
-}
-
-Options github_auth(const std::string& token) {
-    Options opt;
-    opt.headers = {"Authorization: Bearer " + token};
-    return opt;
 }
 
 // How long GitHub wants ringer to wait, or 0 if `r` isn't a rate limit. Running out of checks for
@@ -787,7 +858,7 @@ double github_wait(const Response& r, bool graphql = false) {
 // GitHub's REST API, one name at a time. With a token it allows 5,000 checks an hour (60 without
 // one, which is why ringer only uses the API when there's a token).
 Result check_github_api(const std::string& u, const std::string& token) {
-    Response r = http("GET", "https://api.github.com/users/" + url_encode(u), "", github_auth(token));
+    Response r = http("GET", "https://api.github.com/users/" + url_encode(u), "", bearer(token));
     const double wait = github_wait(r);
     if (wait > 0) return {State::RateLimited, "", wait};
     Result out;
@@ -811,7 +882,7 @@ bool lookup_github(const std::vector<std::string>& names, std::set<std::string>&
     }
     query += " }";
     Response r = http("POST", "https://api.github.com/graphql", "{\"query\":" + json_quote(query) + "}",
-                      github_auth(token));
+                      bearer(token));
     const double wait = github_wait(r, true);
     if (wait > 0) {
         why = {State::RateLimited, "", wait};
@@ -840,7 +911,7 @@ bool lookup_github(const std::vector<std::string>& names, std::set<std::string>&
 
 // Asks GitHub whether `token` works, without using up a check. Returns "" if it does.
 std::string github_token_problem(const std::string& token) {
-    Response r = http("GET", "https://api.github.com/rate_limit", "", github_auth(token));
+    Response r = http("GET", "https://api.github.com/rate_limit", "", bearer(token));
     if (r.status == 200) return "";
     if (r.status == 0) return r.error;
     if (r.status == 401) return "GitHub says that token isn't valid";
@@ -989,12 +1060,35 @@ Platform roblox_platform() {
     return p;
 }
 
-Platform minecraft_platform() {
-    Platform p{"Minecraft (Java)", LOWER + DIGITS + "_", valid_minecraft, check_minecraft, 1.0,
-               "Looks names up 10 at a time with Mojang's profile lookup. Names that were just "
-               "changed are locked for a while and banned names also show as free."};
+// Minecraft holds some names that no player has right now: ones changed away from in the last 37
+// days, banned accounts' and old accounts' that were never moved to Microsoft. Mojang's public
+// lookups say nobody has those, and with 3 characters almost every "free" one is held. Only the
+// logged in check sees them, so without a Minecraft token hits are marked not double-checked.
+Platform minecraft_platform(const std::string& token) {
+    Platform p{"Minecraft (Java)", LOWER + DIGITS + "_", valid_minecraft, check_minecraft, 1.0, ""};
     p.lookup = lookup_minecraft;
     p.batch = 10;
+    if (token_works(token)) {
+        p.check = [token](const std::string& u) { return check_minecraft_signed_in(u, token); };
+        p.confirm = true;
+        p.note = "Looks names up 10 at a time, then double-checks any that no player has with the check "
+                 "minecraft.net's name change page uses. That one knows about names Minecraft is holding "
+                 "(changed in the last 37 days, banned, or never moved to Microsoft), so those count as taken.";
+        return p;
+    }
+    p.unsure = "not double-checked, Minecraft may be holding it";
+    p.check = [unsure = p.unsure](const std::string& u) {
+        Result r = check_minecraft(u);
+        if (r.state == State::Available) {
+            r.detail = unsure;
+            r.unconfirmed = true;
+        }
+        return r;
+    };
+    p.note = "Looks names up 10 at a time with Mojang's public lookup, which can't see names Minecraft is "
+             "holding (changed in the last 37 days, banned, or never moved to Microsoft). With 3 characters "
+             "nearly every hit is one of those. Hits are marked \"not double-checked\". Add a Minecraft token "
+             "(Other apps > Minecraft token) to check them properly.";
     return p;
 }
 
@@ -1293,7 +1387,8 @@ std::string clock_in(double seconds) {
 struct Config {
     std::string webhook;
     std::string mention;       // "", "@everyone", or a Discord user ID
-    std::string github_token;  // makes GitHub checks use the API, see check_github_api
+    std::string github_token;     // makes GitHub checks use the API, see check_github_api
+    std::string minecraft_token;  // lets Minecraft hits get double-checked, see minecraft_platform
     // App name -> when its last long rate limit ends (unix time), so a restart knows about it.
     std::map<std::string, long long> limited_until;
 };
@@ -1313,6 +1408,8 @@ Config load_config() {
             cfg.mention = value;
         } else if (key == "github_token") {
             cfg.github_token = value;
+        } else if (key == "minecraft_token") {
+            cfg.minecraft_token = value;
         } else if (starts_with(key, "limited_until.")) {
             try {
                 cfg.limited_until[key.substr(14)] = std::stoll(value);
@@ -1327,6 +1424,7 @@ bool save_config(const Config& cfg) {
     std::ofstream f(CONFIG_FILE);
     f << "webhook=" << cfg.webhook << "\n" << "mention=" << cfg.mention << "\n";
     if (!cfg.github_token.empty()) f << "github_token=" << cfg.github_token << "\n";
+    if (!cfg.minecraft_token.empty()) f << "minecraft_token=" << cfg.minecraft_token << "\n";
     const long long now = std::time(nullptr);
     for (const auto& app : cfg.limited_until) {
         if (app.second > now) f << "limited_until." << app.first << "=" << app.second << "\n";
@@ -1523,51 +1621,96 @@ bool custom_platform(Platform& out) {
     return true;
 }
 
-void github_token_settings(Config& cfg) {
+// A login token that gives an app a better check, and the screen for setting it.
+struct TokenScreen {
+    std::string app;                // "GitHub"
+    std::string* token;             // where it's kept in the config
+    std::string with, without;      // what that app's checks use with a token and without
+    std::string where;              // how to get one
+    std::string chars;              // characters a token can have
+    // Asks the app whether a token works. Returns "" if it does, and may say whose it is in `who`.
+    std::function<std::string(const std::string&, std::string&)> test;
+};
+
+// "on", "expired", or how long it has left if the token says.
+std::string token_status(const std::string& token) {
+    if (token.empty()) return "off";
+    const double left = token_seconds_left(token);
+    if (left <= 60) return paint(YELLOW, "ran out, set a new one");
+    if (left < 1e9) return paint(GREEN, "on") + ", works for another " + duration_text(left);
+    return paint(GREEN, "on");
+}
+
+std::string token_hint(const std::string& token) {
+    if (token.empty()) return "off";
+    return token_works(token) ? paint(GREEN, "on") : paint(YELLOW, "ran out");
+}
+
+void token_settings(Config& cfg, const TokenScreen& t) {
     for (;;) {
-        screen({"ringer", "Other apps", "GitHub token"});
-        const bool on = !cfg.github_token.empty();
-        print_lines(box("GitHub token", {
-            paint(DIM, "Status   ") + (on ? paint(GREEN, "on") : "off"),
-            paint(DIM, "Checks   ") + (on ? "GitHub's API, 100 names per request" : "profile pages"),
+        screen({"ringer", "Other apps", t.app + " token"});
+        const bool on = token_works(*t.token);
+        print_lines(box(t.app + " token", {
+            paint(DIM, "Status   ") + token_status(*t.token),
+            paint(DIM, "Checks   ") + (on ? t.with : t.without),
         }, ui_width()));
         std::cout << "\n";
 
         int pick = menu("What do you want to do?", {{"Set token", ""}, {"Remove token", ""}}, "Back");
         if (pick == 0) return;
         if (pick == 2) {
-            if (!on) {
+            if (t.token->empty()) {
                 flash(YELLOW, "There's no token to remove.");
                 continue;
             }
-            cfg.github_token.clear();
-            if (save_config(cfg)) flash(GREEN, "Token removed. GitHub checks use profile pages again.");
+            t.token->clear();
+            if (save_config(cfg)) flash(GREEN, "Token removed. " + t.app + " checks use " + t.without + " again.");
             else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
             continue;
         }
 
-        screen({"ringer", "Other apps", "GitHub token", "Set token"});
-        text_box("Where to get one",
-                 "On github.com: Settings > Developer settings > Personal access tokens > Fine-grained "
-                 "tokens > Generate new token. It doesn't need any permissions, the defaults are fine. "
-                 "Treat it like a password, ringer saves it in " + std::string(CONFIG_FILE) + ".");
+        screen({"ringer", "Other apps", t.app + " token", "Set token"});
+        text_box("Where to get one", t.where);
         std::string token;
         for (;;) {
             token = read_line("Token (blank to go back): ");
-            if (token.empty() || only_chars(token, LOWER + UPPER + DIGITS + "_")) break;
-            say_error("That doesn't look like a GitHub token.");
+            // Copied from a request's Authorization header, it can start with "Bearer ".
+            if (to_lower(token).rfind("bearer ", 0) == 0) token = trim(token.substr(7));
+            if (token.empty() || only_chars(token, t.chars)) break;
+            say_error("That doesn't look like a " + t.app + " token.");
         }
         if (token.empty()) continue;
-        std::cout << "\n " << paint(DIM, "Checking it with GitHub...") << std::flush;
-        std::string problem = github_token_problem(token);
+        std::cout << "\n " << paint(DIM, "Checking it with " + t.app + "...") << std::flush;
+        std::string who;
+        std::string problem = t.test(token, who);
         if (!problem.empty()) {
             flash(RED, "Didn't work: " + problem);
             continue;
         }
-        cfg.github_token = token;
-        if (save_config(cfg)) flash(GREEN, "Token saved. GitHub checks use the API now.");
+        *t.token = token;
+        const std::string whose = who.empty() ? "" : " for " + who;
+        if (save_config(cfg)) flash(GREEN, "Token saved" + whose + ". " + t.app + " checks use " + t.with + " now.");
         else flash(YELLOW, "The token works, but ringer couldn't save it to " + std::string(CONFIG_FILE) + ".");
     }
+}
+
+TokenScreen github_token_screen(Config& cfg) {
+    return {"GitHub", &cfg.github_token, "the API", "profile pages",
+            "On github.com: Settings > Developer settings > Personal access tokens > Fine-grained "
+            "tokens > Generate new token. It doesn't need any permissions, the defaults are fine. "
+            "Treat it like a password, ringer saves it in " + std::string(CONFIG_FILE) + ".",
+            LOWER + UPPER + DIGITS + "_",
+            [](const std::string& token, std::string&) { return github_token_problem(token); }};
+}
+
+TokenScreen minecraft_token_screen(Config& cfg) {
+    return {"Minecraft", &cfg.minecraft_token, "the logged in check", "the public lookup",
+            "Log in on minecraft.net and open your profile page. Press F12, open the Network tab and "
+            "reload the page. Click a request to api.minecraftservices.com and copy what comes after "
+            "\"Bearer \" in its Authorization header. It works for about a day. Until then anyone who "
+            "has it can change your Minecraft name and skin, so don't share it. ringer saves it in " +
+                std::string(CONFIG_FILE) + ".",
+            LOWER + UPPER + DIGITS + "_-.", minecraft_token_problem};
 }
 
 // Returns false if they backed out to the main menu.
@@ -1575,18 +1718,20 @@ bool pick_other_app(Config& cfg, Platform& out) {
     for (;;) {
         screen({"ringer", "Other apps"});
         const bool token = !cfg.github_token.empty();
+        const bool signed_in = token_works(cfg.minecraft_token);
         int pick = menu("Which app?",
-                        {{"Minecraft (Java)", limit_hint(cfg, "Minecraft (Java)", "10 per request")},
+                        {{"Minecraft (Java)", limit_hint(cfg, "Minecraft (Java)", signed_in ? "10 per request" : "public lookup")},
                          {"GitHub", limit_hint(cfg, "GitHub", token ? "100 per request" : "profile page")},
                          {"Lichess", limit_hint(cfg, "Lichess", "300 per request")},
                          {"Chess.com", limit_hint(cfg, "Chess.com", "sign-up check")},
                          {"GitLab", limit_hint(cfg, "GitLab", "sign-up check")},
                          {"Custom site", "any profile URL"},
-                         {"GitHub token", token ? paint(GREEN, "on") : "off"}},
+                         {"GitHub token", token_hint(cfg.github_token)},
+                         {"Minecraft token", token_hint(cfg.minecraft_token)}},
                         "Back");
         switch (pick) {
             case 0: return false;
-            case 1: out = minecraft_platform(); return true;
+            case 1: out = minecraft_platform(cfg.minecraft_token); return true;
             case 2: out = github_platform(cfg.github_token); return true;
             case 3: out = lichess_platform(); return true;
             case 4: out = chesscom_platform(); return true;
@@ -1594,7 +1739,8 @@ bool pick_other_app(Config& cfg, Platform& out) {
             case 6:
                 if (custom_platform(out)) return true;
                 break;
-            default: github_token_settings(cfg);
+            case 7: token_settings(cfg, github_token_screen(cfg)); break;
+            default: token_settings(cfg, minecraft_token_screen(cfg));
         }
     }
 }
@@ -2040,7 +2186,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
         if (batched && found.count(to_lower(name))) {
             res = {State::Taken, ""};
         } else if (batched && !p.confirm) {
-            res = {State::Available, ""};
+            res = {State::Available, p.unsure};
+            res.unconfirmed = !p.unsure.empty();
         } else {
             for (;;) {
                 pace(false);
@@ -2130,7 +2277,7 @@ void run(const Platform& p, const Job& job, Config& cfg) {
 // ---------------------------------------------------------------------------
 
 std::vector<Platform> every_platform(const Config& cfg) {
-    return {discord_platform(), roblox_platform(), minecraft_platform(), github_platform(cfg.github_token),
+    return {discord_platform(), roblox_platform(), minecraft_platform(cfg.minecraft_token), github_platform(cfg.github_token),
             lichess_platform(), chesscom_platform(), gitlab_platform()};
 }
 
@@ -2178,7 +2325,8 @@ void print_everywhere_summary(const std::vector<NameResult>& results, size_t app
         if (r.free.empty()) {
             text = "free nowhere";
             color = DIM;
-        } else if (r.free.size() == apps) {
+        } else if (r.free.size() == apps &&
+                   std::none_of(r.free.begin(), r.free.end(), [](const std::string& f) { return f.back() == '?'; })) {
             text = "free everywhere";
             color = std::string(GREEN) + BOLD;
         } else {

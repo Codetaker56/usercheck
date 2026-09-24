@@ -82,7 +82,7 @@ Want to know where a name is free? Pick **Every app** on the main screen and typ
    GitLab            not allowed  (reserved by GitLab)
 ```
 
-Then a summary like `vokar  free on Discord, Minecraft (Java), Lichess, Chess.com?`. Hits get saved to `available.txt` as usual, and the webhook gets one ping per name listing every app it's free on.
+Then a summary like `vokar  free on Discord, Minecraft (Java), Lichess, Chess.com?` (`?` means not double-checked). Hits get saved to `available.txt` as usual, and the webhook gets one ping per name listing every app it's free on.
 
 Keep it to a handful of names. If an app rate limits you, ringer waits it out when it's a minute or less. Anything longer (Discord's half hour, say) and that app gets skipped for the rest of the run, so it doesn't hold up the other six. Names an app doesn't allow (like `a.b` on Roblox) show as not allowed there without asking the site.
 
@@ -111,6 +111,19 @@ Without a token, ringer checks GitHub by loading profile pages, one name at a ti
 Treat the token like a password. Why not always use the API? Without a token it only allows 60 checks an hour, which is way slower than loading profile pages.
 
 If a batch lookup ever fails, ringer checks that batch one name at a time with GitHub's regular API (5,000 an hour) instead, so a run never stalls on it.
+
+## Minecraft token
+
+Minecraft holds some names that no player has right now: ones someone changed away from in the last 37 days, banned accounts' names, and old accounts' names that were never moved to Microsoft. Mojang's public lookup says nobody has those, and minecraft.net still won't let you take them. With 3 characters, almost every "free" name is one of these.
+
+So without a token, Minecraft hits are marked **not double-checked**. With one, ringer double-checks every name the public lookup doesn't find using the same check minecraft.net's name change page uses, which knows about held names.
+
+1. Log in on minecraft.net and open your profile page
+2. Press F12, open the Network tab and reload the page
+3. Click a request to `api.minecraftservices.com` and copy what comes after `Bearer ` in its Authorization header (pasting it with `Bearer ` in front is fine too)
+4. In ringer: Other apps > Minecraft token > Set token. It checks the token and tells you whose it is
+
+The token works for about a day, then ringer goes back to marking hits not double-checked until you set a new one. **Until it runs out, anyone who has it can change your Minecraft name and skin**, so don't share it or your `ringer.cfg`.
 
 ## Rate limits
 
@@ -147,7 +160,7 @@ The only ways around Discord's limit are rotating through proxies or checking th
 |---|---|---|
 | Roblox | Roblox's user lookup, 100 names per request, then sign-up validation for anything it doesn't find | High, it's the same check sign-up uses |
 | Discord | Discord's sign-up username suggestions, then its sign-up "is this taken" check for anything that looks free. No login or token needed | High when double-checked. Hits marked "not double-checked" are very likely free but only the first check saw them |
-| Minecraft | Mojang's bulk profile lookup, 10 names per request | Medium, recently changed and banned names show as free |
+| Minecraft | Mojang's bulk profile lookup, 10 names per request, then with a [Minecraft token](#minecraft-token) the name change page's check for anything it doesn't find | High with a token. Without one, hits are marked not double-checked because held names look free |
 | GitHub | GitHub's API if you've set a token (100 names per request, users and organizations), otherwise the profile page | Medium, reserved/deleted names come back as not found too |
 | Lichess | Lichess' user lookup, 300 names per request. Closed accounts count as taken | High, Lichess never frees a name. It does turn down some offensive names at sign-up that ringer can't see |
 | Chess.com | Chess.com's public API, then the sign-up form's check for anything with no account | High when double-checked (it catches banned words too). "Not double-checked" hits have no account, closed ones included |
@@ -163,4 +176,5 @@ From test runs in September 2026, some places that aren't picked clean yet:
 - Roblox: about 1 in 3 random 5-character names
 - Lichess: over half of random 4-letter names
 - GitLab: about 3 in 4 random 4-letter names
-- Minecraft and Chess.com: most random 5-letter names
+- Chess.com: most random 5-letter names
+- Minecraft: most random 5-letter names look free, but set a Minecraft token before trusting that, and don't bother with 3 characters
