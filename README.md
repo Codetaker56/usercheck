@@ -46,6 +46,8 @@ Or with CMake anywhere: `cmake -S . -B build && cmake --build build --config Rel
 
 Windows uses WinHTTP, which is built into Windows, so there's nothing extra to install. Linux and macOS use libcurl.
 
+**Tests:** `pip install -r tests/requirements.txt` then `python3 tests/run_tests.py` (Linux or macOS, needs g++ and libcurl's headers). It builds a copy of ringer that talks to a fake version of every site (`tests/fake_server.py`) and runs it through about 20 situations: batch lookups, each site's rate limits, lookups that fail, Ctrl+C, the webhook, Every app. It takes about 3 minutes because some of them wait out real rate limit timers. GitHub Actions runs it on every push, and a release only gets published if it passes.
+
 **Making a new release:** Actions tab > build > Run workflow, type a tag like `v1.1.0`, and it publishes the .exe to Releases.
 
 ## Use it

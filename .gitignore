@@ -6,3 +6,4 @@ usercheck.cfg
 build/
 ringer
 ringer.exe
+__pycache__/
