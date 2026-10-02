@@ -24,8 +24,9 @@ ringer used to be called **usercheck**. Same tool, new name and a new look. If y
  ;XX10***h_  '_fucYQwbo*mYxu(!              | [3]  Other apps                 |
  {XX{Y*****pCzzCqa**bLXxu|<'                | [4]  Every app    all 9 at once |
  +XXc{jma*****hwLJznnj}!                    | [5]  Webhook pings          off |
-  -vXXzj\ftfrjrvn\]i'                       |                                 |
-    l_})))1}->;'                            | [0]  Quit                       |
+  -vXXzj\ftfrjrvn\]i'                       | [6]  Hit sound             beep |
+    l_})))1}->;'                            |                                 |
+                                            | [0]  Quit                       |
                                             +---------------------------------+
 ```
 
@@ -38,7 +39,7 @@ ringer used to be called **usercheck**. Same tool, new name and a new look. If y
 | OS | Command |
 |---|---|
 | Windows (Visual Studio) | Open the folder in Visual Studio (it picks up `CMakeLists.txt`), or in a Developer Command Prompt: `cl /std:c++17 /EHsc /O2 /utf-8 ringer.cpp` |
-| Windows (MinGW) | `g++ -std=c++17 -O2 -static ringer.cpp -o ringer.exe -lwinhttp` |
+| Windows (MinGW) | `g++ -std=c++17 -O2 -static ringer.cpp -o ringer.exe -lwinhttp -lwinmm` |
 | Linux | `sudo apt install libcurl4-openssl-dev` then `g++ -std=c++17 -O2 ringer.cpp -o ringer -lcurl` |
 | macOS | `clang++ -std=c++17 -O2 ringer.cpp -o ringer -lcurl` |
 
@@ -62,7 +63,7 @@ Every screen has a header showing where you are (like `ringer > Discord > Random
 
    Then how many seconds to wait between requests. Each app has a sensible default, just press Enter.
 3. Watch the results scroll past with a progress bar underneath showing how far along it is, how many it's found, and roughly how long is left. If the site rate limits you, the bar counts down the wait (see [Rate limits](#rate-limits)).
-4. Hits show up in green, beep, get saved to `available.txt`, and get posted to your Discord webhook if you set one up.
+4. Hits show up in green, beep (or play your own sound, see [Hit sound](#hit-sound)), get saved to `available.txt`, and get posted to your Discord webhook if you set one up.
 5. When it's done you get a summary card: how many were available, taken, not allowed, or errored, how long it took, and the names it found.
 
 Ctrl+C stops a run early and still shows you the summary. If you were checking names from a `.txt` file, the ones it didn't get to are saved to `unchecked.txt`, so you can load that next time and carry on where you left off.
@@ -89,6 +90,12 @@ Then a summary like `vokar  free on Discord, Minecraft (Java), Lichess, Chess.co
 Keep it to a handful of names. If an app rate limits you, ringer waits it out when it's a minute or less. Anything longer (Discord's half hour, say) and that app gets skipped for the rest of the run, so it doesn't hold up the others. Names an app doesn't allow (like `a.b` on Roblox) show as not allowed there without asking the site.
 
 ringer only prints plain ASCII, so it looks right in every Windows console font, including the old raster fonts. Colors need Windows 10 or newer. On older Windows it runs in plain black and white. It's laid out for an 80-column window, and if the window is narrower it drops the Saturn and keeps the rest.
+
+## Hit sound
+
+Pick **Hit sound** on the main screen to turn the sound for hits on or off, or swap the beep for your own `.wav` or `.mp3` (drag the file into the window). It plays the file once so you know it works, and saves it to `ringer.cfg`. **Use the beep** goes back to the beep, and **Play it** plays whatever's set.
+
+It makes a sound at most once a second, so a run that finds a pile of names at once doesn't turn into noise. On Windows it plays the file with what's built into Windows. On macOS it uses `afplay`, and on Linux whichever of `paplay`, `aplay` (`.wav` only) or `ffplay` you have.
 
 ## Discord webhook pings
 
@@ -158,7 +165,9 @@ The only ways around Discord's limit are rotating through proxies or checking th
 
 **GitLab** allows about 20 checks a minute, so ringer waits 3 seconds between them by default.
 
-**Cloudflare Pay** and **guns.lol** didn't rate limit 60 and 50 checks in a row in testing, so they default to half a second between them.
+**Cloudflare Pay** checks 50 names at once, since it didn't rate limit 1,500 checks made that way in testing (they took 19 seconds). The seconds between requests go between each lot of 50. If any of them gets rate limited, ringer waits once and checks those again.
+
+**guns.lol** didn't rate limit 50 checks in a row in testing, so it defaults to half a second between them.
 
 ## How it checks
 
@@ -171,7 +180,7 @@ The only ways around Discord's limit are rotating through proxies or checking th
 | Lichess | Lichess' user lookup, 300 names per request. Closed accounts count as taken | High, Lichess never frees a name. It does turn down some offensive names at sign-up that ringer can't see |
 | Chess.com | Chess.com's public API, then the sign-up form's check for anything with no account | High when double-checked (it catches banned words too). "Not double-checked" hits have no account, closed ones included |
 | GitLab | The check GitLab's sign-up form uses. Covers groups too, since they share names with users | High. Names GitLab keeps for its own pages show as not allowed |
-| Cloudflare Pay | The check the cloudflare.pay reservation page uses | High. Names Cloudflare won't hand out (like `cloudflare`) show as not allowed, ones it holds back (like `matthew`) as taken |
+| Cloudflare Pay | The check the cloudflare.pay reservation page uses, 50 names at once | High. Names Cloudflare won't hand out (like `cloudflare`) show as not allowed, ones it holds back (like `matthew`) as taken |
 | guns.lol | The check guns.lol's sign-up page uses | High. Names guns.lol keeps for itself (like `admin`) show as not allowed |
 | Custom | Profile URL 404 | Depends on the site, test with a name you know exists first |
 

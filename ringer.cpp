@@ -31,8 +31,10 @@
 #  endif
 #  include <windows.h>
 #  include <winhttp.h>
+#  include <mmsystem.h>
 #  ifdef _MSC_VER
 #    pragma comment(lib, "winhttp.lib")
+#    pragma comment(lib, "winmm.lib")
 #  endif
 #  ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #    define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
@@ -498,13 +500,24 @@ size_t on_header(char* p, size_t size, size_t n, void* userdata) {
     return size * n;
 }
 
+// One libcurl handle per thread, since some sites get checked lots of names at once (see
+// check_at_once). Each keeps its connections open for that thread's next request.
+struct CurlHandle {
+    CURL* h;
+    CurlHandle() {
+        static const bool ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+        h = ready ? curl_easy_init() : nullptr;
+    }
+    ~CurlHandle() { if (h) curl_easy_cleanup(h); }
+    CurlHandle(const CurlHandle&) = delete;
+    CurlHandle& operator=(const CurlHandle&) = delete;
+};
+
 Response http(const std::string& method, const std::string& url, const std::string& body = "",
               const Options& opt = {}) {
     Response r;
-    static CURL* curl = [] {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        return curl_easy_init();
-    }();
+    thread_local CurlHandle handle;
+    CURL* curl = handle.h;
     if (!curl) {
         r.error = "couldn't start libcurl";
         return r;
@@ -589,7 +602,19 @@ struct Platform {
     // When set, a name the lookup can't find is only probably free: it counts as available but not
     // double-checked, with this as the reason.
     std::string unsure = "";
+    // For sites with no batch lookup that don't mind lots of requests at once: `check` runs on this
+    // many names side by side, and the run's delay goes between each lot of them.
+    size_t at_once = 0;
 };
+
+// Runs p.check on every one of `names` at the same time, one thread each.
+std::vector<Result> check_at_once(const Platform& p, const std::vector<std::string>& names) {
+    std::vector<Result> out(names.size(), Result{State::Error, ""});
+    std::vector<std::thread> threads;
+    for (size_t k = 0; k < names.size(); ++k) threads.emplace_back([&p, &names, &out, k] { out[k] = p.check(names[k]); });
+    for (std::thread& t : threads) t.join();
+    return out;
+}
 
 // Handles the answers every check treats the same: no response, and rate limits.
 bool common_result(const Response& r, Result& out) {
@@ -1039,7 +1064,7 @@ bool valid_gitlab(const std::string& u) {
 // Cloudflare Wallet handles (yourname.cloudflare.pay), checked with the reservation page's own
 // check. It answers RESERVED_TAG two ways: with a 400 for names nobody can have (like "cloudflare"),
 // and with a 200 for names that are held back the same way a taken one is (like "matthew"). It
-// didn't rate limit 60 checks back to back (measured Oct 2026).
+// didn't rate limit 1,500 checks made 50 at a time, in 19 seconds (measured Oct 2026).
 Result check_cloudflare_pay(const std::string& u) {
     Response r = http("GET", "https://cloudflare.pay/api/check?tag=" + url_encode(to_lower(u)));
     Result out;
@@ -1208,10 +1233,12 @@ Platform gitlab_platform() {
 }
 
 Platform cloudflare_pay_platform() {
-    return {"Cloudflare Pay", LOWER + DIGITS + "-", valid_cloudflare_pay, check_cloudflare_pay, 0.5,
-            "Checks Cloudflare Wallet handles (yourname.cloudflare.pay) with the check the reservation "
-            "page uses. Reserving one needs a Cloudflare account, and for now a handle is just a "
-            "reservation: it can't send or hold money yet."};
+    Platform p{"Cloudflare Pay", LOWER + DIGITS + "-", valid_cloudflare_pay, check_cloudflare_pay, 0.5,
+               "Checks Cloudflare Wallet handles (yourname.cloudflare.pay) with the check the reservation "
+               "page uses, 50 names at a time. Reserving one needs a Cloudflare account, and for now a "
+               "handle is just a reservation: it can't send or hold money yet."};
+    p.at_once = 50;
+    return p;
 }
 
 Platform guns_platform() {
@@ -1476,6 +1503,8 @@ struct Config {
     std::string minecraft_token;  // lets Minecraft hits get double-checked, see minecraft_platform
     // App name -> when its last long rate limit ends (unix time), so a restart knows about it.
     std::map<std::string, long long> limited_until;
+    bool sound = true;        // make a sound for each hit
+    std::string sound_file;   // play this .wav or .mp3 instead of the console beep
 };
 
 Config load_config() {
@@ -1495,6 +1524,10 @@ Config load_config() {
             cfg.github_token = value;
         } else if (key == "minecraft_token") {
             cfg.minecraft_token = value;
+        } else if (key == "sound") {
+            cfg.sound = value != "off";
+        } else if (key == "sound_file") {
+            cfg.sound_file = value;
         } else if (starts_with(key, "limited_until.")) {
             try {
                 cfg.limited_until[key.substr(14)] = std::stoll(value);
@@ -1510,6 +1543,8 @@ bool save_config(const Config& cfg) {
     f << "webhook=" << cfg.webhook << "\n" << "mention=" << cfg.mention << "\n";
     if (!cfg.github_token.empty()) f << "github_token=" << cfg.github_token << "\n";
     if (!cfg.minecraft_token.empty()) f << "minecraft_token=" << cfg.minecraft_token << "\n";
+    f << "sound=" << (cfg.sound ? "on" : "off") << "\n";
+    if (!cfg.sound_file.empty()) f << "sound_file=" << cfg.sound_file << "\n";
     const long long now = std::time(nullptr);
     for (const auto& app : cfg.limited_until) {
         if (app.second > now) f << "limited_until." << app.first << "=" << app.second << "\n";
@@ -1660,6 +1695,112 @@ void webhook_settings(Config& cfg) {
             cfg.mention.clear();
             if (save_config(cfg)) flash(GREEN, "Webhook turned off.");
             else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hit sound
+// ---------------------------------------------------------------------------
+
+// Starts playing a .wav or .mp3 without waiting for it. Returns false if it couldn't.
+#ifdef _WIN32
+// Windows' MCI plays both kinds, with nothing to install. Starting it again cuts the last one off.
+bool play_file(const std::string& path) {
+    if (!std::ifstream(path)) return false;
+    mciSendStringW(L"close ringer_hit", nullptr, 0, nullptr);
+    const std::wstring open = L"open \"" + widen(path) + L"\" type mpegvideo alias ringer_hit";
+    if (mciSendStringW(open.c_str(), nullptr, 0, nullptr) != 0) return false;
+    return mciSendStringW(L"play ringer_hit", nullptr, 0, nullptr) == 0;
+}
+#else
+// Hands it to the system's player in the background: afplay on macOS, and on Linux whichever of
+// paplay, aplay (.wav only) or ffplay is there.
+bool play_file(const std::string& path) {
+    if (!std::ifstream(path)) return false;
+    std::string q = "'";
+    for (char c : path) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    q += "'";
+#  ifdef __APPLE__
+    const std::string cmd = "(afplay " + q + ") >/dev/null 2>&1 </dev/null &";
+#  else
+    const std::string cmd = "(paplay " + q + " || aplay -q " + q + " || ffplay -nodisp -autoexit -loglevel quiet " + q +
+                            ") >/dev/null 2>&1 </dev/null &";
+#  endif
+    return std::system(cmd.c_str()) == 0;
+}
+#endif
+
+// The sound file if there is one and it plays, otherwise the console beep.
+void play_sound(const Config& cfg) {
+    if (cfg.sound_file.empty() || !play_file(cfg.sound_file)) std::cout << "\a" << std::flush;
+}
+
+// For a hit. At most one a second, so a run finding lots at once doesn't turn into noise.
+void hit_sound(const Config& cfg) {
+    using namespace std::chrono;
+    static steady_clock::time_point last{};
+    if (!cfg.sound || steady_clock::now() - last < seconds(1)) return;
+    last = steady_clock::now();
+    play_sound(cfg);
+}
+
+std::string file_name(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+// Menu hint, like "on", "off" or "alert.mp3".
+std::string sound_hint(const Config& cfg) {
+    if (!cfg.sound) return "off";
+    return paint(GREEN, cfg.sound_file.empty() ? "beep" : fit(file_name(cfg.sound_file), 16));
+}
+
+void sound_settings(Config& cfg) {
+    auto save = [&](const std::string& done) {
+        if (save_config(cfg)) flash(GREEN, done);
+        else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
+    };
+    for (;;) {
+        screen({"ringer", "Hit sound"});
+        print_lines(box("Hit sound", {
+            paint(DIM, "Status   ") + (cfg.sound ? paint(GREEN, "on") : "off"),
+            paint(DIM, "Sound    ") + (cfg.sound_file.empty() ? "the console beep" : fit(cfg.sound_file, ui_width() - 14)),
+        }, ui_width()));
+        std::cout << "\n";
+
+        int pick = menu("What do you want to do?",
+                        {{cfg.sound ? "Turn off" : "Turn on", ""}, {"Use a sound file", ".wav or .mp3"},
+                         {"Use the beep", ""}, {"Play it", ""}},
+                        "Back");
+        if (pick == 0) return;
+        if (pick == 1) {
+            cfg.sound = !cfg.sound;
+            save(cfg.sound ? "Hit sound on." : "Hit sound off.");
+        } else if (pick == 2) {
+            screen({"ringer", "Hit sound", "Sound file"});
+            std::cout << " " << paint(DIM, "A .wav or .mp3. Drag it into this window or type its path.") << "\n";
+            std::string path;
+            for (;;) {
+                path = read_line("File (blank to go back): ");
+                while (!path.empty() && (path.front() == '"' || path.front() == '\'')) path.erase(0, 1);
+                while (!path.empty() && (path.back() == '"' || path.back() == '\'')) path.pop_back();
+                if (path.empty() || std::ifstream(path)) break;
+                say_error("Can't find that file.");
+            }
+            if (path.empty()) continue;
+            if (!play_file(path)) {
+                flash(YELLOW, "Couldn't play " + file_name(path) + ", so nothing changed.");
+                continue;
+            }
+            cfg.sound_file = path;
+            cfg.sound = true;
+            save("Hits will play " + file_name(path) + ".");
+        } else if (pick == 3) {
+            cfg.sound_file.clear();
+            save("Hits will beep.");
+        } else {
+            play_sound(cfg);
         }
     }
 }
@@ -2171,6 +2312,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
         std::string how = "Up to " + std::to_string(p.batch) + " names per request";
         if (p.lookup_gap > job.delay) how += ", at most one every " + format_seconds(p.lookup_gap) + "s (" + p.name + "'s limit)";
         std::cout << " " << paint(DIM, how + ".") << "\n";
+    } else if (p.at_once > 1) {
+        std::cout << " " << paint(DIM, std::to_string(p.at_once) + " names at a time, the wait goes between each lot.") << "\n";
     }
     std::cout << " " << paint(DIM, std::string("Hits get saved to ") + RESULTS_FILE +
                                        (use_webhook ? " and posted to your Discord webhook." : "."))
@@ -2258,6 +2401,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
     std::set<std::string> found;  // lowercased names the current batch lookup found
     size_t looked_up = 0;         // names before this index have had a batch lookup
     bool lookup_failed = false;   // the current batch gets checked one name at a time instead
+    std::vector<Result> ahead;    // for p.at_once: answers for the names from ahead_from on
+    size_t ahead_from = 0;
 
     for (size_t i = 0; i < total && !g_stop; ++i) {
         const std::string& name = job.names[i];
@@ -2282,9 +2427,31 @@ void run(const Platform& p, const Job& job, Config& cfg) {
             }
         }
 
+        // Checked side by side, the next lot at a time. It counts as one request for the time left,
+        // like a batch lookup. A name that got rate limited goes through the usual one-at-a-time
+        // check below, which waits it out.
+        if (p.at_once > 1 && i == ahead_from + ahead.size()) {
+            const std::vector<std::string> lot(job.names.begin() + i, job.names.begin() + std::min(total, i + p.at_once));
+            pace(true);
+            ahead = check_at_once(p, lot);
+            ahead_from = i;
+            sent_now(true, true);
+            // Any that got rate limited: wait once, as long as the longest ask, before rechecking them.
+            const Result* limited = nullptr;
+            for (const Result& r : ahead) {
+                if (r.state == State::RateLimited && (!limited || r.retry_after > limited->retry_after)) limited = &r;
+            }
+            if (limited && !g_stop) wait_for(*limited);
+            if (g_stop) break;
+        }
+
         Result res{State::Error, ""};
         const bool batched = p.lookup && !lookup_failed;
-        if (batched && found.count(to_lower(name))) {
+        const bool checked_ahead = i >= ahead_from && i - ahead_from < ahead.size() &&
+                                   ahead[i - ahead_from].state != State::RateLimited;
+        if (checked_ahead) {
+            res = ahead[i - ahead_from];
+        } else if (batched && found.count(to_lower(name))) {
             res = {State::Taken, ""};
         } else if (batched && !p.confirm) {
             res = {State::Available, p.unsure};
@@ -2330,7 +2497,7 @@ void run(const Platform& p, const Job& job, Config& cfg) {
             case State::Available: {
                 save_hit(p.name, name, res.unconfirmed);
                 report(std::string(GREEN) + BOLD, "AVAILABLE", res.detail);
-                std::cout << "\a" << std::flush;
+                hit_sound(cfg);
                 if (use_webhook) {
                     std::string err = webhook_send(cfg, "\xE2\x9C\x85 `" + name + "` is available on **" + p.name + "**" +
                                                             (res.unconfirmed ? " (not double-checked)" : ""));
@@ -2580,7 +2747,7 @@ void check_everywhere(const std::vector<std::string>& names, Config& cfg) {
         }
         nr.partial = g_stop;
         if (!nr.free.empty()) {
-            std::cout << "\a" << std::flush;
+            hit_sound(cfg);
             if (use_webhook) {
                 std::string where;
                 for (size_t i = 0; i < nr.free.size(); ++i) {
@@ -2722,6 +2889,7 @@ int home_screen(const Config& cfg) {
         {"Other apps", ""},
         {"Every app", "all " + std::to_string(every_platform(cfg).size()) + " at once"},
         {"Webhook pings", cfg.webhook.empty() ? "off" : paint(GREEN, "on")},
+        {"Hit sound", sound_hint(cfg)},
     };
 
     std::vector<std::string> right;
@@ -2762,7 +2930,8 @@ bool pick_platform(Config& cfg, Platform& out) {
             case 4:
                 if (!every_app(cfg)) return false;
                 break;
-            default: webhook_settings(cfg);
+            case 5: webhook_settings(cfg); break;
+            default: sound_settings(cfg);
         }
     }
 }

@@ -156,7 +156,8 @@ def test(fn):
 @test
 def main_menu_lists_everything():
     r = Run("0\n")
-    r.expect("[1]  Discord", "[2]  Roblox", "[3]  Other apps", "[4]  Every app", "[5]  Webhook pings", "[0]  Quit")
+    r.expect("[1]  Discord", "[2]  Roblox", "[3]  Other apps", "[4]  Every app", "[5]  Webhook pings", "[6]  Hit sound",
+             "[0]  Quit")
 
 
 @test
@@ -423,8 +424,32 @@ def cloudflare_pay_reserved_and_held_names():
     r.expect("reserved by Cloudflare", "Skipped 3 name(s)")
     r.expect_summary("2 available", "2 taken", "1 not allowed")
     # Capitals get lowercased for Cloudflare, like its own page does.
-    assert [q["query"] for q in r.to("cloudflare.pay")][3] == "tag=freecf"
+    assert sorted(q["query"] for q in r.to("cloudflare.pay")) == \
+        ["tag=cloudflare", "tag=free-cf", "tag=freecf", "tag=matthew", "tag=takencf"]
     assert r.file("available.txt") == "Cloudflare Pay: FreeCF\nCloudflare Pay: free-cf\n"
+
+
+@test
+def cloudflare_pay_checks_50_at_a_time():
+    names = [f"free{n:03d}" for n in range(120)] + ["takencf"]
+    r = Run(from_file(CLOUDFLARE_PAY, "names.txt"), scenario="cf_slow", files={"names.txt": "\n".join(names) + "\n"})
+    r.expect_summary("120 available", "1 taken", "Checked 121 of 121")
+    asked = r.to("cloudflare.pay")
+    assert len(asked) == 121
+    # Each takes 0.3s, so one after another would be over 36s. Three lots of up to 50 take about 1s.
+    assert asked[-1]["t"] - asked[0]["t"] < 5, asked[-1]["t"] - asked[0]["t"]
+    # Answers still come out in the file's order.
+    lines = [l for l in r.screen.splitlines() if re.match(r"\s+\d+/121 ", l)]
+    assert [l.split()[-1] for l in lines] == names, lines[:3]
+    assert r.file("available.txt").splitlines()[0] == "Cloudflare Pay: free000"
+
+
+@test
+def cloudflare_pay_rate_limited_name_in_a_lot_is_checked_again():
+    names = [f"free{n:03d}" for n in range(10)]
+    r = Run(from_file(CLOUDFLARE_PAY, "names.txt"), scenario="cf_429", files={"names.txt": "\n".join(names) + "\n"})
+    r.expect_summary("10 available", "0 errors", "Slowed by 1 rate limit")
+    assert len(r.to("cloudflare.pay")) == 11
 
 
 # --- guns.lol ---------------------------------------------------------------------------------
@@ -452,6 +477,27 @@ def turning_off_the_webhook_keeps_the_rest_of_the_settings():
     r.expect("Webhook turned off.")
     cfg = r.file("ringer.cfg")
     assert "webhook=\n" in cfg and f"github_token={TOKEN}" in cfg and f"limited_until.Discord={later}" in cfg, cfg
+
+
+@test
+def hit_sound_settings():
+    r = Run("6\n1\n2\nnope.wav\nalert.wav\n0\n0\n", files={"alert.wav": "RIFF"})
+    r.expect("Hit sound off.", "Can't find that file.", "Hits will play alert.wav.")
+    cfg = r.file("ringer.cfg")
+    assert "sound=on\n" in cfg and "sound_file=alert.wav\n" in cfg, cfg
+    r = Run("6\n3\n0\n0\n", cfg="sound_file=alert.wav\n")
+    r.expect("Hits will beep.")
+    assert "sound_file" not in r.file("ringer.cfg")
+
+
+@test
+def hits_beep_unless_the_sound_is_off():
+    keys = from_file(CLOUDFLARE_PAY, "names.txt")
+    r = Run(keys, files={"names.txt": "freeone\n"})
+    assert "\a" in r.raw
+    r = Run(keys, cfg="sound=off\n", files={"names.txt": "freeone\n"})
+    r.expect_summary("1 available")
+    assert "\a" not in r.raw
 
 
 # --- Every app --------------------------------------------------------------------------------
