@@ -1064,6 +1064,50 @@ bool valid_cloudflare_pay(const std::string& u) {
            symbols_between(u, "-");
 }
 
+// guns.lol's sign-up check. Every request without a guns_clearance cookie gets a 307 back to the
+// same URL that hands one out, and the cookie only works from the IP it was given to. So ringer
+// keeps the cookie for later names and only goes round again when it's handed a new one. It didn't
+// rate limit 50 checks back to back (measured Oct 2026).
+std::string g_guns_cookie;
+
+Result check_guns(const std::string& u) {
+    const std::string url = "https://guns.lol/api/auth/username/" + url_encode(to_lower(u)) + "/availability";
+    Options opt;
+    opt.follow_redirects = false;
+    for (int tries = 0; tries < 3; ++tries) {
+        opt.headers.clear();
+        if (!g_guns_cookie.empty()) opt.headers.push_back("Cookie: " + g_guns_cookie);
+        Response r = http("GET", url, "", opt);
+        Result out;
+        if (common_result(r, out)) return out;
+        if (r.status >= 300 && r.status < 400) {
+            const std::string cookie = r.header("set-cookie");
+            if (!starts_with(cookie, "guns_clearance=")) break;
+            g_guns_cookie = cookie.substr(0, cookie.find(';'));
+            continue;
+        }
+        std::string available, error;
+        if (r.status == 200 && json_get(r.body, "available", available)) {
+            if (available == "true") return {State::Available, ""};
+            json_get(r.body, "error", error);
+            // "Username is taken." for players' names, "Username is not available." for ones like "admin".
+            const std::string why = to_lower(error);
+            if (why.find("taken") != std::string::npos) return {State::Taken, ""};
+            if (why.find("not available") != std::string::npos) return {State::Invalid, "reserved by guns.lol"};
+            return {State::Invalid, error.empty() ? "invalid" : plain_text(error)};
+        }
+        return {State::Error, http_error(r)};
+    }
+    return {State::Error, "guns.lol kept redirecting instead of answering"};
+}
+
+// 1-16 letters, numbers, '_' and '.', never two dots in a row (sign-up squashes them into one).
+// Capitals are fine, guns.lol lowercases them.
+bool valid_guns(const std::string& u) {
+    return !u.empty() && u.size() <= 16 && only_chars(u, LOWER + UPPER + DIGITS + "_.") &&
+           u.find("..") == std::string::npos;
+}
+
 Platform discord_platform() {
     return {"Discord", LOWER + DIGITS + "_.", valid_discord, check_discord, 1.5,
             "Checks each name with Discord's sign-up suggestions first, then double-checks anything "
@@ -1168,6 +1212,12 @@ Platform cloudflare_pay_platform() {
             "Checks Cloudflare Wallet handles (yourname.cloudflare.pay) with the check the reservation "
             "page uses. Reserving one needs a Cloudflare account, and for now a handle is just a "
             "reservation: it can't send or hold money yet."};
+}
+
+Platform guns_platform() {
+    return {"guns.lol", LOWER + DIGITS + "_.", valid_guns, check_guns, 0.5,
+            "Checks guns.lol bio page names with the check its sign-up page uses. Names guns.lol keeps "
+            "for itself (like \"admin\") show as not allowed."};
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,6 +1811,7 @@ bool pick_other_app(Config& cfg, Platform& out) {
                          {"Chess.com", limit_hint(cfg, "Chess.com", "sign-up check")},
                          {"GitLab", limit_hint(cfg, "GitLab", "sign-up check")},
                          {"Cloudflare Pay", limit_hint(cfg, "Cloudflare Pay", "wallet handles")},
+                         {"guns.lol", limit_hint(cfg, "guns.lol", "sign-up check")},
                          {"Custom site", "any profile URL"},
                          {"GitHub token", token_hint(cfg.github_token)},
                          {"Minecraft token", token_hint(cfg.minecraft_token)}},
@@ -1773,10 +1824,11 @@ bool pick_other_app(Config& cfg, Platform& out) {
             case 4: out = chesscom_platform(); return true;
             case 5: out = gitlab_platform(); return true;
             case 6: out = cloudflare_pay_platform(); return true;
-            case 7:
+            case 7: out = guns_platform(); return true;
+            case 8:
                 if (custom_platform(out)) return true;
                 break;
-            case 8: token_settings(cfg, github_token_screen(cfg)); break;
+            case 9: token_settings(cfg, github_token_screen(cfg)); break;
             default: token_settings(cfg, minecraft_token_screen(cfg));
         }
     }
@@ -2334,7 +2386,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
 
 std::vector<Platform> every_platform(const Config& cfg) {
     return {discord_platform(), roblox_platform(), minecraft_platform(cfg.minecraft_token), github_platform(cfg.github_token),
-            lichess_platform(), chesscom_platform(), gitlab_platform(), cloudflare_pay_platform()};
+            lichess_platform(), chesscom_platform(), gitlab_platform(), cloudflare_pay_platform(),
+            guns_platform()};
 }
 
 // Names typed with spaces or commas between them. An '@' in front is fine, and repeats (ignoring
@@ -2565,8 +2618,9 @@ bool every_app(Config& cfg) {
         screen({"ringer", "Every app"});
         text_box("How it works",
                  "Type a name, or a few with spaces between them, and ringer checks each one on Discord, "
-                 "Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab and Cloudflare Pay. Keep it to a handful: Discord "
-                 "only allows about 20 checks before a long wait, and an app that wants ringer to wait "
+                 "Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab, Cloudflare Pay and guns.lol. Keep "
+                 "it to a handful: Discord only allows about 20 checks before a long wait, and an app that "
+                 "wants ringer to wait "
                  "more than a minute gets skipped for the rest of the run.");
         std::string limited;
         for (const Platform& p : every_platform(cfg)) {

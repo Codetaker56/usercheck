@@ -5,6 +5,7 @@ Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 ## v2.6.0
 
 - **New: Cloudflare Pay** (Other apps > Cloudflare Pay). Checks `yourname.cloudflare.pay` wallet handles with the same check the reservation page uses. Handles are 3-32 letters, numbers and hyphens. It's in Every app too. Reserving one needs a Cloudflare account, and for now a handle can't send or hold money.
+- **New: guns.lol** (Other apps > guns.lol). Checks bio page names with the check guns.lol's sign-up page uses: 1-16 letters, numbers, `_` and `.`. Names guns.lol keeps for itself (like `admin`) show as not allowed. It's in Every app too.
 
 ## v2.5.1
 

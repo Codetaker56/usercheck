@@ -42,10 +42,10 @@ MC_TOKEN = minecraft_token(86400)
 WEBHOOK = "https://discord.com/api/webhooks/1/abc"
 
 # Main menu: 1 Discord, 2 Roblox, 3 Other apps, 4 Every app, 5 Webhook pings.
-# Other apps: 1 Minecraft, 2 GitHub, 3 Lichess, 4 Chess.com, 5 GitLab, 6 Cloudflare Pay, 7 Custom site,
-# 8 GitHub token, 9 Minecraft token.
+# Other apps: 1 Minecraft, 2 GitHub, 3 Lichess, 4 Chess.com, 5 GitLab, 6 Cloudflare Pay, 7 guns.lol,
+# 8 Custom site, 9 GitHub token, 10 Minecraft token.
 DISCORD, ROBLOX, MINECRAFT, GITHUB, LICHESS, CHESSCOM, GITLAB = "1", "2", "3\n1", "3\n2", "3\n3", "3\n4", "3\n5"
-CLOUDFLARE_PAY = "3\n6"
+CLOUDFLARE_PAY, GUNS = "3\n6", "3\n7"
 
 
 def from_file(app, filename):
@@ -276,7 +276,7 @@ def checks_pace_themselves_under_a_limit_that_does_not_say_how_long():
 @test
 def minecraft_token_is_checked_before_it_is_saved():
     bad = minecraft_token(86400, who="someone else")
-    r = Run(f"3\n9\n1\nnot a token!\nBearer {bad}\n1\nBearer {MC_TOKEN}\n0\n0\n0\n")
+    r = Run(f"3\n10\n1\nnot a token!\nBearer {bad}\n1\nBearer {MC_TOKEN}\n0\n0\n0\n")
     r.expect("That doesn't look like a Minecraft token.", "Didn't work: Minecraft says that token is wrong or has run out",
              "Token saved for Doobert1. Minecraft checks use the logged in check now.")
     assert f"minecraft_token={MC_TOKEN}\n" in r.file("ringer.cfg"), "saved without the Bearer"
@@ -318,7 +318,7 @@ def ctrl_c_during_a_wait_saves_the_unchecked_names():
 
 @test
 def github_token_is_checked_before_it_is_saved():
-    r = Run("3\n8\n1\nghp_bad\n1\nnot a token\n" + TOKEN + "\n0\n0\n0\n")
+    r = Run("3\n9\n1\nghp_bad\n1\nnot a token\n" + TOKEN + "\n0\n0\n0\n")
     r.expect("Didn't work: GitHub says that token isn't valid", "That doesn't look like a GitHub token.",
              "Token saved. GitHub checks use the API now.")
     assert "github_token=" + TOKEN in r.file("ringer.cfg")
@@ -427,6 +427,22 @@ def cloudflare_pay_reserved_and_held_names():
     assert r.file("available.txt") == "Cloudflare Pay: FreeCF\nCloudflare Pay: free-cf\n"
 
 
+# --- guns.lol ---------------------------------------------------------------------------------
+
+@test
+def guns_gets_a_clearance_cookie_once_and_keeps_it():
+    r = Run(from_file(GUNS, "names.txt"),
+            files={"names.txt": "takenguns\nadmin\nFree.Guns\na..b\na-b\nfree_guns\nshop\n"})
+    r.expect("reserved by guns.lol", "Skipped 2 name(s)")
+    r.expect_summary("2 available", "2 taken", "1 not allowed")
+    asked = r.to("guns.lol")
+    # One trip round for the cookie, then every name with it.
+    assert len(asked) == 6, [q["path"] for q in asked]
+    assert asked[0]["path"] == asked[1]["path"] == "/api/auth/username/takenguns/availability"
+    assert "free.guns" in asked[3]["path"], "capitals get lowercased"
+    assert r.file("available.txt") == "guns.lol: Free.Guns\nguns.lol: free_guns\n"
+
+
 # --- Settings ---------------------------------------------------------------------------------
 
 @test
@@ -443,14 +459,14 @@ def turning_off_the_webhook_keeps_the_rest_of_the_settings():
 @test
 def every_app_checks_each_name_everywhere():
     r = Run("4\nfreeall torvalds a.b @freeall\n0\n", cfg=f"webhook={WEBHOOK}\nmention=\n")
-    r.expect("Checking 3 names on 8 apps.", "breaks Roblox's username rules")
+    r.expect("Checking 3 names on 9 apps.", "breaks Roblox's username rules")
     r.expect_summary("freeall free on Discord, Roblox, Minecraft (Java)?, GitHub, Lichess,",
-                     "| | Chess.com, GitLab, Cloudflare Pay |",
-                     "torvalds free on Roblox, Minecraft (Java)?, Lichess, Chess.com, GitLab, | | Cloudflare Pay |",
-                     "a.b free on Discord, GitLab", "3 pings sent")
+                     "| | Chess.com, GitLab, Cloudflare Pay, guns.lol |",
+                     "torvalds free on Roblox, Minecraft (Java)?, Lichess, Chess.com, GitLab, | | Cloudflare Pay, guns.lol |",
+                     "a.b free on Discord, GitLab, guns.lol", "3 pings sent")
     pings = [json.loads(q["body"])["content"] for q in r.to("discord.com", "/api/webhooks/")]
-    assert pings[2] == "✅ `a.b` is available on **Discord**, **GitLab**", pings
-    assert len(r.file("available.txt").splitlines()) == 16
+    assert pings[2] == "✅ `a.b` is available on **Discord**, **GitLab**, **guns.lol**", pings
+    assert len(r.file("available.txt").splitlines()) == 19
 
 
 @test

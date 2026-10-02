@@ -1,7 +1,7 @@
 # ringer (formerly usercheck)
 to finally show your friends you have atleast something cool
 
-Finds unclaimed usernames on Discord, Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab, Cloudflare Pay (`yourname.cloudflare.pay` wallet handles), or any site you give it a profile URL for, and can ping you on Discord when it finds one.
+Finds unclaimed usernames on Discord, Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab, Cloudflare Pay (`yourname.cloudflare.pay` wallet handles), guns.lol, or any site you give it a profile URL for, and can ping you on Discord when it finds one.
 
 ringer used to be called **usercheck**. Same tool, new name and a new look. If you have a `usercheck.cfg` from back then, ringer still reads your webhook settings from it.
 
@@ -22,7 +22,7 @@ ringer used to be called **usercheck**. Same tool, new name and a new look. If y
    ~zuja**):Jmdka**ohbw0CJOk*bYrv}`         | [1]  Discord                    |
   -Xc(o**w  !uLOZmZOQLCZdo*Zcnx-'           | [2]  Roblox                     |
  ;XX10***h_  '_fucYQwbo*mYxu(!              | [3]  Other apps                 |
- {XX{Y*****pCzzCqa**bLXxu|<'                | [4]  Every app    all 8 at once |
+ {XX{Y*****pCzzCqa**bLXxu|<'                | [4]  Every app    all 9 at once |
  +XXc{jma*****hwLJznnj}!                    | [5]  Webhook pings          off |
   -vXXzj\ftfrjrvn\]i'                       |                                 |
     l_})))1}->;'                            | [0]  Quit                       |
@@ -54,7 +54,7 @@ Windows uses WinHTTP, which is built into Windows, so there's nothing extra to i
 
 Every screen has a header showing where you are (like `ringer > Discord > Random 4 letters`). Type the number next to what you want and press Enter. `0` goes back, or quits from the main screen.
 
-1. Pick an app: Discord, Roblox, or Other apps (Minecraft, GitHub, Lichess, Chess.com, GitLab, Cloudflare Pay, or a custom site URL). Or pick Every app to check a few names everywhere at once, see [Every app](#every-app).
+1. Pick an app: Discord, Roblox, or Other apps (Minecraft, GitHub, Lichess, Chess.com, GitLab, Cloudflare Pay, guns.lol, or a custom site URL). Or pick Every app to check a few names everywhere at once, see [Every app](#every-app).
 2. Pick what to check:
    - names from a `.txt` file (one per line, you can drag the file into the window)
    - random 3/4/5 letters or 3/4/5 characters (letters, numbers, and whatever symbols that app allows)
@@ -69,7 +69,7 @@ Ctrl+C stops a run early and still shows you the summary. If you were checking n
 
 ## Every app
 
-Want to know where a name is free? Pick **Every app** on the main screen and type a name, or a few with spaces between them (`vokar zelmi @kuvo` works). ringer checks each one on Discord, Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab and Cloudflare Pay, one app per line as the answers come in:
+Want to know where a name is free? Pick **Every app** on the main screen and type a name, or a few with spaces between them (`vokar zelmi @kuvo` works). ringer checks each one on Discord, Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab, Cloudflare Pay and guns.lol, one app per line as the answers come in:
 
 ```
  vokar
@@ -81,6 +81,7 @@ Want to know where a name is free? Pick **Every app** on the main screen and typ
    Chess.com         AVAILABLE    (not double-checked, the sign-up check is resting)
    GitLab            not allowed  (reserved by GitLab)
    Cloudflare Pay    AVAILABLE
+   guns.lol          taken
 ```
 
 Then a summary like `vokar  free on Discord, Minecraft (Java), Lichess, Chess.com?, Cloudflare Pay` (`?` means not double-checked). Hits get saved to `available.txt` as usual, and the webhook gets one ping per name listing every app it's free on.
@@ -157,7 +158,7 @@ The only ways around Discord's limit are rotating through proxies or checking th
 
 **GitLab** allows about 20 checks a minute, so ringer waits 3 seconds between them by default.
 
-**Cloudflare Pay** didn't rate limit 60 checks in a row in testing, so it defaults to half a second between them.
+**Cloudflare Pay** and **guns.lol** didn't rate limit 60 and 50 checks in a row in testing, so they default to half a second between them.
 
 ## How it checks
 
@@ -171,6 +172,7 @@ The only ways around Discord's limit are rotating through proxies or checking th
 | Chess.com | Chess.com's public API, then the sign-up form's check for anything with no account | High when double-checked (it catches banned words too). "Not double-checked" hits have no account, closed ones included |
 | GitLab | The check GitLab's sign-up form uses. Covers groups too, since they share names with users | High. Names GitLab keeps for its own pages show as not allowed |
 | Cloudflare Pay | The check the cloudflare.pay reservation page uses | High. Names Cloudflare won't hand out (like `cloudflare`) show as not allowed, ones it holds back (like `matthew`) as taken |
+| guns.lol | The check guns.lol's sign-up page uses | High. Names guns.lol keeps for itself (like `admin`) show as not allowed |
 | Custom | Profile URL 404 | Depends on the site, test with a name you know exists first |
 
 ## Reality check
