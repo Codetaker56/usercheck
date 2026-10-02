@@ -2,6 +2,11 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.6.0
+
+- **New: Cloudflare Pay** (Other apps > Cloudflare Pay). Checks `yourname.cloudflare.pay` wallet handles with the same check the reservation page uses. Handles are 3-32 letters, numbers and hyphens. It's in Every app too. Reserving one needs a Cloudflare account, and for now a handle can't send or hold money.
+- **New: guns.lol** (Other apps > guns.lol). Checks bio page names with the check guns.lol's sign-up page uses: 1-16 letters, numbers, `_` and `.`. Names guns.lol keeps for itself (like `admin`) show as not allowed. It's in Every app too.
+
 ## v2.5.1
 
 - **Far fewer rate limit stops** on sites that say "too many requests" without saying for how long: Minecraft's logged in check, Roblox's validation, GitLab and Chess.com. ringer used to keep going until it got told off, then wait 15 seconds, 30, a minute and so on. Now it waits a moment, spaces its checks further apart, and eases back up as they go through, so it settles just under the site's real limit. The summary says where it settled. In testing against a limit like that, 30 names took 18 seconds with one stop instead of over a minute with five.

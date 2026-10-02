@@ -1036,6 +1036,78 @@ bool valid_gitlab(const std::string& u) {
            symbols_between(u, "_.-") && !ends_with(".git") && !ends_with(".atom");
 }
 
+// Cloudflare Wallet handles (yourname.cloudflare.pay), checked with the reservation page's own
+// check. It answers RESERVED_TAG two ways: with a 400 for names nobody can have (like "cloudflare"),
+// and with a 200 for names that are held back the same way a taken one is (like "matthew"). It
+// didn't rate limit 60 checks back to back (measured Oct 2026).
+Result check_cloudflare_pay(const std::string& u) {
+    Response r = http("GET", "https://cloudflare.pay/api/check?tag=" + url_encode(to_lower(u)));
+    Result out;
+    if (common_result(r, out)) return out;
+    std::string available, code, error;
+    json_get(r.body, "code", code);
+    if (r.status == 200 && json_get(r.body, "available", available)) {
+        if (available == "true") return {State::Available, ""};
+        return {State::Taken, ""};
+    }
+    if (r.status == 400 && code == "RESERVED_TAG") return {State::Invalid, "reserved by Cloudflare"};
+    if (r.status == 400 && code == "INVALID_TAG" && json_get(r.body, "error", error)) {
+        return {State::Invalid, plain_text(error)};
+    }
+    return {State::Error, http_error(r)};
+}
+
+// 3-32 letters, numbers and hyphens, with no hyphen at either end or two in a row. Capitals are
+// fine, Cloudflare lowercases them.
+bool valid_cloudflare_pay(const std::string& u) {
+    return u.size() >= 3 && u.size() <= 32 && only_chars(u, LOWER + UPPER + DIGITS + "-") && is_alnum(u.front()) &&
+           symbols_between(u, "-");
+}
+
+// guns.lol's sign-up check. Every request without a guns_clearance cookie gets a 307 back to the
+// same URL that hands one out, and the cookie only works from the IP it was given to. So ringer
+// keeps the cookie for later names and only goes round again when it's handed a new one. It didn't
+// rate limit 50 checks back to back (measured Oct 2026).
+std::string g_guns_cookie;
+
+Result check_guns(const std::string& u) {
+    const std::string url = "https://guns.lol/api/auth/username/" + url_encode(to_lower(u)) + "/availability";
+    Options opt;
+    opt.follow_redirects = false;
+    for (int tries = 0; tries < 3; ++tries) {
+        opt.headers.clear();
+        if (!g_guns_cookie.empty()) opt.headers.push_back("Cookie: " + g_guns_cookie);
+        Response r = http("GET", url, "", opt);
+        Result out;
+        if (common_result(r, out)) return out;
+        if (r.status >= 300 && r.status < 400) {
+            const std::string cookie = r.header("set-cookie");
+            if (!starts_with(cookie, "guns_clearance=")) break;
+            g_guns_cookie = cookie.substr(0, cookie.find(';'));
+            continue;
+        }
+        std::string available, error;
+        if (r.status == 200 && json_get(r.body, "available", available)) {
+            if (available == "true") return {State::Available, ""};
+            json_get(r.body, "error", error);
+            // "Username is taken." for players' names, "Username is not available." for ones like "admin".
+            const std::string why = to_lower(error);
+            if (why.find("taken") != std::string::npos) return {State::Taken, ""};
+            if (why.find("not available") != std::string::npos) return {State::Invalid, "reserved by guns.lol"};
+            return {State::Invalid, error.empty() ? "invalid" : plain_text(error)};
+        }
+        return {State::Error, http_error(r)};
+    }
+    return {State::Error, "guns.lol kept redirecting instead of answering"};
+}
+
+// 1-16 letters, numbers, '_' and '.', never two dots in a row (sign-up squashes them into one).
+// Capitals are fine, guns.lol lowercases them.
+bool valid_guns(const std::string& u) {
+    return !u.empty() && u.size() <= 16 && only_chars(u, LOWER + UPPER + DIGITS + "_.") &&
+           u.find("..") == std::string::npos;
+}
+
 Platform discord_platform() {
     return {"Discord", LOWER + DIGITS + "_.", valid_discord, check_discord, 1.5,
             "Checks each name with Discord's sign-up suggestions first, then double-checks anything "
@@ -1133,6 +1205,19 @@ Platform gitlab_platform() {
             "Uses the check GitLab's sign-up form does. Users and groups share names on GitLab, so "
             "a group's name counts as taken, and names GitLab keeps for its own pages show as not "
             "allowed. GitLab only allows about 20 of these checks a minute, hence the 3 seconds."};
+}
+
+Platform cloudflare_pay_platform() {
+    return {"Cloudflare Pay", LOWER + DIGITS + "-", valid_cloudflare_pay, check_cloudflare_pay, 0.5,
+            "Checks Cloudflare Wallet handles (yourname.cloudflare.pay) with the check the reservation "
+            "page uses. Reserving one needs a Cloudflare account, and for now a handle is just a "
+            "reservation: it can't send or hold money yet."};
+}
+
+Platform guns_platform() {
+    return {"guns.lol", LOWER + DIGITS + "_.", valid_guns, check_guns, 0.5,
+            "Checks guns.lol bio page names with the check its sign-up page uses. Names guns.lol keeps "
+            "for itself (like \"admin\") show as not allowed."};
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,6 +1810,8 @@ bool pick_other_app(Config& cfg, Platform& out) {
                          {"Lichess", limit_hint(cfg, "Lichess", "300 per request")},
                          {"Chess.com", limit_hint(cfg, "Chess.com", "sign-up check")},
                          {"GitLab", limit_hint(cfg, "GitLab", "sign-up check")},
+                         {"Cloudflare Pay", limit_hint(cfg, "Cloudflare Pay", "wallet handles")},
+                         {"guns.lol", limit_hint(cfg, "guns.lol", "sign-up check")},
                          {"Custom site", "any profile URL"},
                          {"GitHub token", token_hint(cfg.github_token)},
                          {"Minecraft token", token_hint(cfg.minecraft_token)}},
@@ -1736,10 +1823,12 @@ bool pick_other_app(Config& cfg, Platform& out) {
             case 3: out = lichess_platform(); return true;
             case 4: out = chesscom_platform(); return true;
             case 5: out = gitlab_platform(); return true;
-            case 6:
+            case 6: out = cloudflare_pay_platform(); return true;
+            case 7: out = guns_platform(); return true;
+            case 8:
                 if (custom_platform(out)) return true;
                 break;
-            case 7: token_settings(cfg, github_token_screen(cfg)); break;
+            case 9: token_settings(cfg, github_token_screen(cfg)); break;
             default: token_settings(cfg, minecraft_token_screen(cfg));
         }
     }
@@ -2297,7 +2386,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
 
 std::vector<Platform> every_platform(const Config& cfg) {
     return {discord_platform(), roblox_platform(), minecraft_platform(cfg.minecraft_token), github_platform(cfg.github_token),
-            lichess_platform(), chesscom_platform(), gitlab_platform()};
+            lichess_platform(), chesscom_platform(), gitlab_platform(), cloudflare_pay_platform(),
+            guns_platform()};
 }
 
 // Names typed with spaces or commas between them. An '@' in front is fine, and repeats (ignoring
@@ -2375,7 +2465,7 @@ void print_everywhere_summary(const std::vector<NameResult>& results, size_t app
 
 // Checks each name on every app, showing each answer as it comes in. An app that makes ringer wait
 // a minute or less gets waited out. One that wants longer is skipped until then, so a long Discord
-// wait doesn't hold up the other six.
+// wait doesn't hold up the others.
 void check_everywhere(const std::vector<std::string>& names, Config& cfg) {
     using namespace std::chrono;
     screen({"ringer", "Every app", "Checking"});
@@ -2528,8 +2618,9 @@ bool every_app(Config& cfg) {
         screen({"ringer", "Every app"});
         text_box("How it works",
                  "Type a name, or a few with spaces between them, and ringer checks each one on Discord, "
-                 "Roblox, Minecraft, GitHub, Lichess, Chess.com and GitLab. Keep it to a handful: Discord "
-                 "only allows about 20 checks before a long wait, and an app that wants ringer to wait "
+                 "Roblox, Minecraft, GitHub, Lichess, Chess.com, GitLab, Cloudflare Pay and guns.lol. Keep "
+                 "it to a handful: Discord only allows about 20 checks before a long wait, and an app that "
+                 "wants ringer to wait "
                  "more than a minute gets skipped for the rest of the run.");
         std::string limited;
         for (const Platform& p : every_platform(cfg)) {
@@ -2629,7 +2720,7 @@ int home_screen(const Config& cfg) {
         {"Discord", limit_hint(cfg, "Discord")},
         {"Roblox", limit_hint(cfg, "Roblox")},
         {"Other apps", ""},
-        {"Every app", "all 7 at once"},
+        {"Every app", "all " + std::to_string(every_platform(cfg).size()) + " at once"},
         {"Webhook pings", cfg.webhook.empty() ? "off" : paint(GREEN, "on")},
     };
 

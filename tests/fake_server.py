@@ -58,6 +58,12 @@ CC_TAKEN = {"hikaru", "takencc"}
 CC_BANNED = {"badwordcc"}  # Chess.com's banned word list
 GL_TAKEN = {"sytses", "gitlab-org"}
 GL_RESERVED = {"api", "explore"}  # redirect to the sign-in page, like the real ones
+CF_TAKEN = {"takencf", "abc"}
+CF_HELD = {"matthew"}  # RESERVED_TAG with a 200, like a taken one
+CF_RESERVED = {"cloudflare"}  # RESERVED_TAG with a 400
+GUNS_TAKEN = {"takenguns", "shop"}
+GUNS_RESERVED = {"admin"}  # "Username is not available."
+guns_cookies = set()  # guns_clearance cookies handed out so far
 
 
 def bump(key):
@@ -109,6 +115,8 @@ class Fake(BaseHTTPRequestHandler):
             "api.chess.com": self.chesscom_api,
             "www.chess.com": self.chesscom_signup,
             "gitlab.com": self.gitlab,
+            "cloudflare.pay": self.cloudflare_pay,
+            "guns.lol": self.guns,
         }.get(host)
         if handler is None:
             return self.send(404, "no fake for " + host, ctype="text/plain")
@@ -283,6 +291,35 @@ class Fake(BaseHTTPRequestHandler):
         if "gitlab_always_429" in SCENARIO or ("gitlab_429" in SCENARIO and bump("gitlab") == 2):
             return self.send(429, too_many, ctype="text/plain")
         return self.send(200, json.dumps({"exists": name in GL_TAKEN}))
+
+    def cloudflare_pay(self, path, q, body):
+        tag = q["tag"][0].lower()
+        if tag in CF_RESERVED:
+            return self.send(400, '{"available":false,"error":"This tag is reserved","code":"RESERVED_TAG"}')
+        if len(tag) < 3:
+            return self.send(400, '{"available":false,"error":"Tag must be at least 3 characters","code":"INVALID_TAG"}')
+        if tag in CF_TAKEN or tag in CF_HELD:
+            code = "RESERVED_TAG" if tag in CF_HELD else "TAG_TAKEN"
+            return self.send(200, json.dumps({"available": False, "normalized": tag, "code": code}))
+        return self.send(200, json.dumps({"available": True, "normalized": tag}))
+
+    def guns(self, path, q, body):
+        # No clearance cookie (or one it never gave out): a 307 back to the same URL that hands one out.
+        cookie = self.headers.get("Cookie", "")
+        if cookie not in guns_cookies:
+            new = "guns_clearance=c%d.%d" % (len(guns_cookies), time.time())
+            guns_cookies.add(new)
+            return self.send(307, '<a href="%s">Temporary Redirect</a>.' % path,
+                             {"Location": path, "Set-Cookie": new + "; Path=/; HttpOnly; Secure; SameSite=Lax"},
+                             ctype="text/html")
+        name = unquote(path.split("/")[4]).lower()
+        if len(name) > 16:
+            return self.send(200, '{"available":false,"error":"Enter a valid username"}')
+        if name in GUNS_TAKEN:
+            return self.send(200, '{"available":false,"error":"Username is taken."}')
+        if name in GUNS_RESERVED:
+            return self.send(200, '{"available":false,"error":"Username is not available."}')
+        return self.send(200, '{"available":true}')
 
 
 if __name__ == "__main__":
