@@ -5,6 +5,7 @@ Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 ## v2.7.0
 
 - **Cloudflare Pay checks 50 names at once.** 300 random names took 14 seconds instead of a few minutes. Cloudflare didn't rate limit 1,500 checks made this way, and if it ever does, ringer waits once and checks those names again.
+- **New: Hit sound** on the main screen. Turn the sound for hits on or off, or play your own `.wav` or `.mp3` instead of the beep. It makes a sound at most once a second, so finding lots of names at once doesn't turn into noise.
 
 ## v2.6.0
 

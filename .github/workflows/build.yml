@@ -36,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64
-      - run: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -static ringer.cpp -o ringer.exe -lwinhttp
+      - run: x86_64-w64-mingw32-g++ -std=c++17 -O2 -s -static ringer.cpp -o ringer.exe -lwinhttp -lwinmm
       - uses: actions/upload-artifact@v4
         with:
           name: ringer-windows

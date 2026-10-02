@@ -31,8 +31,10 @@
 #  endif
 #  include <windows.h>
 #  include <winhttp.h>
+#  include <mmsystem.h>
 #  ifdef _MSC_VER
 #    pragma comment(lib, "winhttp.lib")
+#    pragma comment(lib, "winmm.lib")
 #  endif
 #  ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #    define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
@@ -1501,6 +1503,8 @@ struct Config {
     std::string minecraft_token;  // lets Minecraft hits get double-checked, see minecraft_platform
     // App name -> when its last long rate limit ends (unix time), so a restart knows about it.
     std::map<std::string, long long> limited_until;
+    bool sound = true;        // make a sound for each hit
+    std::string sound_file;   // play this .wav or .mp3 instead of the console beep
 };
 
 Config load_config() {
@@ -1520,6 +1524,10 @@ Config load_config() {
             cfg.github_token = value;
         } else if (key == "minecraft_token") {
             cfg.minecraft_token = value;
+        } else if (key == "sound") {
+            cfg.sound = value != "off";
+        } else if (key == "sound_file") {
+            cfg.sound_file = value;
         } else if (starts_with(key, "limited_until.")) {
             try {
                 cfg.limited_until[key.substr(14)] = std::stoll(value);
@@ -1535,6 +1543,8 @@ bool save_config(const Config& cfg) {
     f << "webhook=" << cfg.webhook << "\n" << "mention=" << cfg.mention << "\n";
     if (!cfg.github_token.empty()) f << "github_token=" << cfg.github_token << "\n";
     if (!cfg.minecraft_token.empty()) f << "minecraft_token=" << cfg.minecraft_token << "\n";
+    f << "sound=" << (cfg.sound ? "on" : "off") << "\n";
+    if (!cfg.sound_file.empty()) f << "sound_file=" << cfg.sound_file << "\n";
     const long long now = std::time(nullptr);
     for (const auto& app : cfg.limited_until) {
         if (app.second > now) f << "limited_until." << app.first << "=" << app.second << "\n";
@@ -1685,6 +1695,112 @@ void webhook_settings(Config& cfg) {
             cfg.mention.clear();
             if (save_config(cfg)) flash(GREEN, "Webhook turned off.");
             else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hit sound
+// ---------------------------------------------------------------------------
+
+// Starts playing a .wav or .mp3 without waiting for it. Returns false if it couldn't.
+#ifdef _WIN32
+// Windows' MCI plays both kinds, with nothing to install. Starting it again cuts the last one off.
+bool play_file(const std::string& path) {
+    if (!std::ifstream(path)) return false;
+    mciSendStringW(L"close ringer_hit", nullptr, 0, nullptr);
+    const std::wstring open = L"open \"" + widen(path) + L"\" type mpegvideo alias ringer_hit";
+    if (mciSendStringW(open.c_str(), nullptr, 0, nullptr) != 0) return false;
+    return mciSendStringW(L"play ringer_hit", nullptr, 0, nullptr) == 0;
+}
+#else
+// Hands it to the system's player in the background: afplay on macOS, and on Linux whichever of
+// paplay, aplay (.wav only) or ffplay is there.
+bool play_file(const std::string& path) {
+    if (!std::ifstream(path)) return false;
+    std::string q = "'";
+    for (char c : path) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    q += "'";
+#  ifdef __APPLE__
+    const std::string cmd = "(afplay " + q + ") >/dev/null 2>&1 </dev/null &";
+#  else
+    const std::string cmd = "(paplay " + q + " || aplay -q " + q + " || ffplay -nodisp -autoexit -loglevel quiet " + q +
+                            ") >/dev/null 2>&1 </dev/null &";
+#  endif
+    return std::system(cmd.c_str()) == 0;
+}
+#endif
+
+// The sound file if there is one and it plays, otherwise the console beep.
+void play_sound(const Config& cfg) {
+    if (cfg.sound_file.empty() || !play_file(cfg.sound_file)) std::cout << "\a" << std::flush;
+}
+
+// For a hit. At most one a second, so a run finding lots at once doesn't turn into noise.
+void hit_sound(const Config& cfg) {
+    using namespace std::chrono;
+    static steady_clock::time_point last{};
+    if (!cfg.sound || steady_clock::now() - last < seconds(1)) return;
+    last = steady_clock::now();
+    play_sound(cfg);
+}
+
+std::string file_name(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+// Menu hint, like "on", "off" or "alert.mp3".
+std::string sound_hint(const Config& cfg) {
+    if (!cfg.sound) return "off";
+    return paint(GREEN, cfg.sound_file.empty() ? "beep" : fit(file_name(cfg.sound_file), 16));
+}
+
+void sound_settings(Config& cfg) {
+    auto save = [&](const std::string& done) {
+        if (save_config(cfg)) flash(GREEN, done);
+        else flash(YELLOW, "Couldn't save " + std::string(CONFIG_FILE) + ".");
+    };
+    for (;;) {
+        screen({"ringer", "Hit sound"});
+        print_lines(box("Hit sound", {
+            paint(DIM, "Status   ") + (cfg.sound ? paint(GREEN, "on") : "off"),
+            paint(DIM, "Sound    ") + (cfg.sound_file.empty() ? "the console beep" : fit(cfg.sound_file, ui_width() - 14)),
+        }, ui_width()));
+        std::cout << "\n";
+
+        int pick = menu("What do you want to do?",
+                        {{cfg.sound ? "Turn off" : "Turn on", ""}, {"Use a sound file", ".wav or .mp3"},
+                         {"Use the beep", ""}, {"Play it", ""}},
+                        "Back");
+        if (pick == 0) return;
+        if (pick == 1) {
+            cfg.sound = !cfg.sound;
+            save(cfg.sound ? "Hit sound on." : "Hit sound off.");
+        } else if (pick == 2) {
+            screen({"ringer", "Hit sound", "Sound file"});
+            std::cout << " " << paint(DIM, "A .wav or .mp3. Drag it into this window or type its path.") << "\n";
+            std::string path;
+            for (;;) {
+                path = read_line("File (blank to go back): ");
+                while (!path.empty() && (path.front() == '"' || path.front() == '\'')) path.erase(0, 1);
+                while (!path.empty() && (path.back() == '"' || path.back() == '\'')) path.pop_back();
+                if (path.empty() || std::ifstream(path)) break;
+                say_error("Can't find that file.");
+            }
+            if (path.empty()) continue;
+            if (!play_file(path)) {
+                flash(YELLOW, "Couldn't play " + file_name(path) + ", so nothing changed.");
+                continue;
+            }
+            cfg.sound_file = path;
+            cfg.sound = true;
+            save("Hits will play " + file_name(path) + ".");
+        } else if (pick == 3) {
+            cfg.sound_file.clear();
+            save("Hits will beep.");
+        } else {
+            play_sound(cfg);
         }
     }
 }
@@ -2381,7 +2497,7 @@ void run(const Platform& p, const Job& job, Config& cfg) {
             case State::Available: {
                 save_hit(p.name, name, res.unconfirmed);
                 report(std::string(GREEN) + BOLD, "AVAILABLE", res.detail);
-                std::cout << "\a" << std::flush;
+                hit_sound(cfg);
                 if (use_webhook) {
                     std::string err = webhook_send(cfg, "\xE2\x9C\x85 `" + name + "` is available on **" + p.name + "**" +
                                                             (res.unconfirmed ? " (not double-checked)" : ""));
@@ -2631,7 +2747,7 @@ void check_everywhere(const std::vector<std::string>& names, Config& cfg) {
         }
         nr.partial = g_stop;
         if (!nr.free.empty()) {
-            std::cout << "\a" << std::flush;
+            hit_sound(cfg);
             if (use_webhook) {
                 std::string where;
                 for (size_t i = 0; i < nr.free.size(); ++i) {
@@ -2773,6 +2889,7 @@ int home_screen(const Config& cfg) {
         {"Other apps", ""},
         {"Every app", "all " + std::to_string(every_platform(cfg).size()) + " at once"},
         {"Webhook pings", cfg.webhook.empty() ? "off" : paint(GREEN, "on")},
+        {"Hit sound", sound_hint(cfg)},
     };
 
     std::vector<std::string> right;
@@ -2813,7 +2930,8 @@ bool pick_platform(Config& cfg, Platform& out) {
             case 4:
                 if (!every_app(cfg)) return false;
                 break;
-            default: webhook_settings(cfg);
+            case 5: webhook_settings(cfg); break;
+            default: sound_settings(cfg);
         }
     }
 }

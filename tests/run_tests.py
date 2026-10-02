@@ -156,7 +156,8 @@ def test(fn):
 @test
 def main_menu_lists_everything():
     r = Run("0\n")
-    r.expect("[1]  Discord", "[2]  Roblox", "[3]  Other apps", "[4]  Every app", "[5]  Webhook pings", "[0]  Quit")
+    r.expect("[1]  Discord", "[2]  Roblox", "[3]  Other apps", "[4]  Every app", "[5]  Webhook pings", "[6]  Hit sound",
+             "[0]  Quit")
 
 
 @test
@@ -476,6 +477,27 @@ def turning_off_the_webhook_keeps_the_rest_of_the_settings():
     r.expect("Webhook turned off.")
     cfg = r.file("ringer.cfg")
     assert "webhook=\n" in cfg and f"github_token={TOKEN}" in cfg and f"limited_until.Discord={later}" in cfg, cfg
+
+
+@test
+def hit_sound_settings():
+    r = Run("6\n1\n2\nnope.wav\nalert.wav\n0\n0\n", files={"alert.wav": "RIFF"})
+    r.expect("Hit sound off.", "Can't find that file.", "Hits will play alert.wav.")
+    cfg = r.file("ringer.cfg")
+    assert "sound=on\n" in cfg and "sound_file=alert.wav\n" in cfg, cfg
+    r = Run("6\n3\n0\n0\n", cfg="sound_file=alert.wav\n")
+    r.expect("Hits will beep.")
+    assert "sound_file" not in r.file("ringer.cfg")
+
+
+@test
+def hits_beep_unless_the_sound_is_off():
+    keys = from_file(CLOUDFLARE_PAY, "names.txt")
+    r = Run(keys, files={"names.txt": "freeone\n"})
+    assert "\a" in r.raw
+    r = Run(keys, cfg="sound=off\n", files={"names.txt": "freeone\n"})
+    r.expect_summary("1 available")
+    assert "\a" not in r.raw
 
 
 # --- Every app --------------------------------------------------------------------------------
