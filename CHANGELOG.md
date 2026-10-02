@@ -2,6 +2,10 @@
 
 Each `## vX.Y.Z` section here becomes the notes for that GitHub release.
 
+## v2.7.0
+
+- **Cloudflare Pay checks 50 names at once.** 300 random names took 14 seconds instead of a few minutes. Cloudflare didn't rate limit 1,500 checks made this way, and if it ever does, ringer waits once and checks those names again.
+
 ## v2.6.0
 
 - **New: Cloudflare Pay** (Other apps > Cloudflare Pay). Checks `yourname.cloudflare.pay` wallet handles with the same check the reservation page uses. Handles are 3-32 letters, numbers and hyphens. It's in Every app too. Reserving one needs a Cloudflare account, and for now a handle can't send or hold money.

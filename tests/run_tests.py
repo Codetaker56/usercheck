@@ -423,8 +423,32 @@ def cloudflare_pay_reserved_and_held_names():
     r.expect("reserved by Cloudflare", "Skipped 3 name(s)")
     r.expect_summary("2 available", "2 taken", "1 not allowed")
     # Capitals get lowercased for Cloudflare, like its own page does.
-    assert [q["query"] for q in r.to("cloudflare.pay")][3] == "tag=freecf"
+    assert sorted(q["query"] for q in r.to("cloudflare.pay")) == \
+        ["tag=cloudflare", "tag=free-cf", "tag=freecf", "tag=matthew", "tag=takencf"]
     assert r.file("available.txt") == "Cloudflare Pay: FreeCF\nCloudflare Pay: free-cf\n"
+
+
+@test
+def cloudflare_pay_checks_50_at_a_time():
+    names = [f"free{n:03d}" for n in range(120)] + ["takencf"]
+    r = Run(from_file(CLOUDFLARE_PAY, "names.txt"), scenario="cf_slow", files={"names.txt": "\n".join(names) + "\n"})
+    r.expect_summary("120 available", "1 taken", "Checked 121 of 121")
+    asked = r.to("cloudflare.pay")
+    assert len(asked) == 121
+    # Each takes 0.3s, so one after another would be over 36s. Three lots of up to 50 take about 1s.
+    assert asked[-1]["t"] - asked[0]["t"] < 5, asked[-1]["t"] - asked[0]["t"]
+    # Answers still come out in the file's order.
+    lines = [l for l in r.screen.splitlines() if re.match(r"\s+\d+/121 ", l)]
+    assert [l.split()[-1] for l in lines] == names, lines[:3]
+    assert r.file("available.txt").splitlines()[0] == "Cloudflare Pay: free000"
+
+
+@test
+def cloudflare_pay_rate_limited_name_in_a_lot_is_checked_again():
+    names = [f"free{n:03d}" for n in range(10)]
+    r = Run(from_file(CLOUDFLARE_PAY, "names.txt"), scenario="cf_429", files={"names.txt": "\n".join(names) + "\n"})
+    r.expect_summary("10 available", "0 errors", "Slowed by 1 rate limit")
+    assert len(r.to("cloudflare.pay")) == 11
 
 
 # --- guns.lol ---------------------------------------------------------------------------------

@@ -498,13 +498,24 @@ size_t on_header(char* p, size_t size, size_t n, void* userdata) {
     return size * n;
 }
 
+// One libcurl handle per thread, since some sites get checked lots of names at once (see
+// check_at_once). Each keeps its connections open for that thread's next request.
+struct CurlHandle {
+    CURL* h;
+    CurlHandle() {
+        static const bool ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+        h = ready ? curl_easy_init() : nullptr;
+    }
+    ~CurlHandle() { if (h) curl_easy_cleanup(h); }
+    CurlHandle(const CurlHandle&) = delete;
+    CurlHandle& operator=(const CurlHandle&) = delete;
+};
+
 Response http(const std::string& method, const std::string& url, const std::string& body = "",
               const Options& opt = {}) {
     Response r;
-    static CURL* curl = [] {
-        curl_global_init(CURL_GLOBAL_DEFAULT);
-        return curl_easy_init();
-    }();
+    thread_local CurlHandle handle;
+    CURL* curl = handle.h;
     if (!curl) {
         r.error = "couldn't start libcurl";
         return r;
@@ -589,7 +600,19 @@ struct Platform {
     // When set, a name the lookup can't find is only probably free: it counts as available but not
     // double-checked, with this as the reason.
     std::string unsure = "";
+    // For sites with no batch lookup that don't mind lots of requests at once: `check` runs on this
+    // many names side by side, and the run's delay goes between each lot of them.
+    size_t at_once = 0;
 };
+
+// Runs p.check on every one of `names` at the same time, one thread each.
+std::vector<Result> check_at_once(const Platform& p, const std::vector<std::string>& names) {
+    std::vector<Result> out(names.size(), Result{State::Error, ""});
+    std::vector<std::thread> threads;
+    for (size_t k = 0; k < names.size(); ++k) threads.emplace_back([&p, &names, &out, k] { out[k] = p.check(names[k]); });
+    for (std::thread& t : threads) t.join();
+    return out;
+}
 
 // Handles the answers every check treats the same: no response, and rate limits.
 bool common_result(const Response& r, Result& out) {
@@ -1039,7 +1062,7 @@ bool valid_gitlab(const std::string& u) {
 // Cloudflare Wallet handles (yourname.cloudflare.pay), checked with the reservation page's own
 // check. It answers RESERVED_TAG two ways: with a 400 for names nobody can have (like "cloudflare"),
 // and with a 200 for names that are held back the same way a taken one is (like "matthew"). It
-// didn't rate limit 60 checks back to back (measured Oct 2026).
+// didn't rate limit 1,500 checks made 50 at a time, in 19 seconds (measured Oct 2026).
 Result check_cloudflare_pay(const std::string& u) {
     Response r = http("GET", "https://cloudflare.pay/api/check?tag=" + url_encode(to_lower(u)));
     Result out;
@@ -1208,10 +1231,12 @@ Platform gitlab_platform() {
 }
 
 Platform cloudflare_pay_platform() {
-    return {"Cloudflare Pay", LOWER + DIGITS + "-", valid_cloudflare_pay, check_cloudflare_pay, 0.5,
-            "Checks Cloudflare Wallet handles (yourname.cloudflare.pay) with the check the reservation "
-            "page uses. Reserving one needs a Cloudflare account, and for now a handle is just a "
-            "reservation: it can't send or hold money yet."};
+    Platform p{"Cloudflare Pay", LOWER + DIGITS + "-", valid_cloudflare_pay, check_cloudflare_pay, 0.5,
+               "Checks Cloudflare Wallet handles (yourname.cloudflare.pay) with the check the reservation "
+               "page uses, 50 names at a time. Reserving one needs a Cloudflare account, and for now a "
+               "handle is just a reservation: it can't send or hold money yet."};
+    p.at_once = 50;
+    return p;
 }
 
 Platform guns_platform() {
@@ -2171,6 +2196,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
         std::string how = "Up to " + std::to_string(p.batch) + " names per request";
         if (p.lookup_gap > job.delay) how += ", at most one every " + format_seconds(p.lookup_gap) + "s (" + p.name + "'s limit)";
         std::cout << " " << paint(DIM, how + ".") << "\n";
+    } else if (p.at_once > 1) {
+        std::cout << " " << paint(DIM, std::to_string(p.at_once) + " names at a time, the wait goes between each lot.") << "\n";
     }
     std::cout << " " << paint(DIM, std::string("Hits get saved to ") + RESULTS_FILE +
                                        (use_webhook ? " and posted to your Discord webhook." : "."))
@@ -2258,6 +2285,8 @@ void run(const Platform& p, const Job& job, Config& cfg) {
     std::set<std::string> found;  // lowercased names the current batch lookup found
     size_t looked_up = 0;         // names before this index have had a batch lookup
     bool lookup_failed = false;   // the current batch gets checked one name at a time instead
+    std::vector<Result> ahead;    // for p.at_once: answers for the names from ahead_from on
+    size_t ahead_from = 0;
 
     for (size_t i = 0; i < total && !g_stop; ++i) {
         const std::string& name = job.names[i];
@@ -2282,9 +2311,31 @@ void run(const Platform& p, const Job& job, Config& cfg) {
             }
         }
 
+        // Checked side by side, the next lot at a time. It counts as one request for the time left,
+        // like a batch lookup. A name that got rate limited goes through the usual one-at-a-time
+        // check below, which waits it out.
+        if (p.at_once > 1 && i == ahead_from + ahead.size()) {
+            const std::vector<std::string> lot(job.names.begin() + i, job.names.begin() + std::min(total, i + p.at_once));
+            pace(true);
+            ahead = check_at_once(p, lot);
+            ahead_from = i;
+            sent_now(true, true);
+            // Any that got rate limited: wait once, as long as the longest ask, before rechecking them.
+            const Result* limited = nullptr;
+            for (const Result& r : ahead) {
+                if (r.state == State::RateLimited && (!limited || r.retry_after > limited->retry_after)) limited = &r;
+            }
+            if (limited && !g_stop) wait_for(*limited);
+            if (g_stop) break;
+        }
+
         Result res{State::Error, ""};
         const bool batched = p.lookup && !lookup_failed;
-        if (batched && found.count(to_lower(name))) {
+        const bool checked_ahead = i >= ahead_from && i - ahead_from < ahead.size() &&
+                                   ahead[i - ahead_from].state != State::RateLimited;
+        if (checked_ahead) {
+            res = ahead[i - ahead_from];
+        } else if (batched && found.count(to_lower(name))) {
             res = {State::Taken, ""};
         } else if (batched && !p.confirm) {
             res = {State::Available, p.unsure};

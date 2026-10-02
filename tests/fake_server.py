@@ -293,7 +293,11 @@ class Fake(BaseHTTPRequestHandler):
         return self.send(200, json.dumps({"exists": name in GL_TAKEN}))
 
     def cloudflare_pay(self, path, q, body):
+        if "cf_slow" in SCENARIO:
+            time.sleep(0.3)  # so checks made one after another would take a while
         tag = q["tag"][0].lower()
+        if "cf_429" in SCENARIO and tag == "free005" and bump("cf_429") == 1:
+            return self.send(429, '{"error":"Too many requests"}', {"Retry-After": "1"})
         if tag in CF_RESERVED:
             return self.send(400, '{"available":false,"error":"This tag is reserved","code":"RESERVED_TAG"}')
         if len(tag) < 3:
@@ -322,5 +326,9 @@ class Fake(BaseHTTPRequestHandler):
         return self.send(200, '{"available":true}')
 
 
+class Server(ThreadingHTTPServer):
+    request_queue_size = 128  # the default 5 makes 50 connections at once wait a second to get in
+
+
 if __name__ == "__main__":
-    ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 8765), Fake).serve_forever()
+    Server(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 8765), Fake).serve_forever()

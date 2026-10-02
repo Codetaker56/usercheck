@@ -158,7 +158,9 @@ The only ways around Discord's limit are rotating through proxies or checking th
 
 **GitLab** allows about 20 checks a minute, so ringer waits 3 seconds between them by default.
 
-**Cloudflare Pay** and **guns.lol** didn't rate limit 60 and 50 checks in a row in testing, so they default to half a second between them.
+**Cloudflare Pay** checks 50 names at once, since it didn't rate limit 1,500 checks made that way in testing (they took 19 seconds). The seconds between requests go between each lot of 50. If any of them gets rate limited, ringer waits once and checks those again.
+
+**guns.lol** didn't rate limit 50 checks in a row in testing, so it defaults to half a second between them.
 
 ## How it checks
 
@@ -171,7 +173,7 @@ The only ways around Discord's limit are rotating through proxies or checking th
 | Lichess | Lichess' user lookup, 300 names per request. Closed accounts count as taken | High, Lichess never frees a name. It does turn down some offensive names at sign-up that ringer can't see |
 | Chess.com | Chess.com's public API, then the sign-up form's check for anything with no account | High when double-checked (it catches banned words too). "Not double-checked" hits have no account, closed ones included |
 | GitLab | The check GitLab's sign-up form uses. Covers groups too, since they share names with users | High. Names GitLab keeps for its own pages show as not allowed |
-| Cloudflare Pay | The check the cloudflare.pay reservation page uses | High. Names Cloudflare won't hand out (like `cloudflare`) show as not allowed, ones it holds back (like `matthew`) as taken |
+| Cloudflare Pay | The check the cloudflare.pay reservation page uses, 50 names at once | High. Names Cloudflare won't hand out (like `cloudflare`) show as not allowed, ones it holds back (like `matthew`) as taken |
 | guns.lol | The check guns.lol's sign-up page uses | High. Names guns.lol keeps for itself (like `admin`) show as not allowed |
 | Custom | Profile URL 404 | Depends on the site, test with a name you know exists first |
 

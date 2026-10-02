@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(ringer ringer.cpp)
 
+find_package(Threads REQUIRED)
+target_link_libraries(ringer PRIVATE Threads::Threads)
+
 if(WIN32)
   target_link_libraries(ringer PRIVATE winhttp)
 else()
