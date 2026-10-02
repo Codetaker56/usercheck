@@ -58,6 +58,9 @@ CC_TAKEN = {"hikaru", "takencc"}
 CC_BANNED = {"badwordcc"}  # Chess.com's banned word list
 GL_TAKEN = {"sytses", "gitlab-org"}
 GL_RESERVED = {"api", "explore"}  # redirect to the sign-in page, like the real ones
+CF_TAKEN = {"takencf", "abc"}
+CF_HELD = {"matthew"}  # RESERVED_TAG with a 200, like a taken one
+CF_RESERVED = {"cloudflare"}  # RESERVED_TAG with a 400
 
 
 def bump(key):
@@ -109,6 +112,7 @@ class Fake(BaseHTTPRequestHandler):
             "api.chess.com": self.chesscom_api,
             "www.chess.com": self.chesscom_signup,
             "gitlab.com": self.gitlab,
+            "cloudflare.pay": self.cloudflare_pay,
         }.get(host)
         if handler is None:
             return self.send(404, "no fake for " + host, ctype="text/plain")
@@ -283,6 +287,17 @@ class Fake(BaseHTTPRequestHandler):
         if "gitlab_always_429" in SCENARIO or ("gitlab_429" in SCENARIO and bump("gitlab") == 2):
             return self.send(429, too_many, ctype="text/plain")
         return self.send(200, json.dumps({"exists": name in GL_TAKEN}))
+
+    def cloudflare_pay(self, path, q, body):
+        tag = q["tag"][0].lower()
+        if tag in CF_RESERVED:
+            return self.send(400, '{"available":false,"error":"This tag is reserved","code":"RESERVED_TAG"}')
+        if len(tag) < 3:
+            return self.send(400, '{"available":false,"error":"Tag must be at least 3 characters","code":"INVALID_TAG"}')
+        if tag in CF_TAKEN or tag in CF_HELD:
+            code = "RESERVED_TAG" if tag in CF_HELD else "TAG_TAKEN"
+            return self.send(200, json.dumps({"available": False, "normalized": tag, "code": code}))
+        return self.send(200, json.dumps({"available": True, "normalized": tag}))
 
 
 if __name__ == "__main__":
